@@ -1,0 +1,92 @@
+# Check with a local registry.
+#
+# We want to check if we can compile examples/tests after bumping the deps by using a local registry.
+# (i.e. if we will publish the right set of crates)
+
+name: pre-release-checks
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  check:
+    runs-on: macos-m1-self-hosted
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'release:registry:compile-test') || contains(github.event.pull_request.labels.*.name, 'release:registry:ci'))) }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-toolchains
+        with:
+          xtensa: "true"
+          riscv: "true"
+
+      # Install the Rust nightly toolchain for RISC-V devices:
+      - uses: ./.github/actions/setup-nightly
+        with:
+          targets: all
+          components: rust-src
+          alias: "true"
+
+      - name: Setup cargo-batch
+        run: |
+          if ! command -v cargo-batch &> /dev/null; then
+              cargo install --git https://github.com/embassy-rs/cargo-batch cargo --bin cargo-batch --locked --force
+          fi
+
+      # Warm the chip-metadata cache while crates.io is still reachable. A cold
+      # cache makes the later `build` step regenerate `esp-metadata-generated`,
+      # which builds the `esp-metadata` tool - and that host tool cannot resolve
+      # its dependencies (e.g. `prettyplease`) against the local registry.
+      - name: warm-metadata-cache
+        run: cargo update-metadata
+
+      - name: init-local-registry
+        run: |
+          cargo xrel-check init
+          cargo xrel-check update
+          cargo xrel-check replace-path-deps
+
+      # Build the compile-tests against the local registry. This is the cheap smoke
+      # test, so it runs first. Gated on `release:registry:compile-test` so it can be
+      # run independently of the heavier CI build.
+      - name: try-build [compile-tests]
+        if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'release:registry:compile-test') }}
+        shell: bash
+        run: |
+          cargo xtask build compile-tests all esp32 --toolchain esp
+          cargo xtask build compile-tests all esp32s2 --toolchain esp
+          cargo xtask build compile-tests all esp32s3 --toolchain esp
+          cargo xtask build compile-tests all esp32s31 --toolchain stable
+          cargo xtask build compile-tests all esp32c2 --toolchain stable
+          cargo xtask build compile-tests all esp32c3 --toolchain stable
+          cargo xtask build compile-tests all esp32c5 --toolchain stable
+          cargo xtask build compile-tests all esp32c6 --toolchain stable
+          cargo xtask build compile-tests all esp32c61 --toolchain stable
+          cargo xtask build compile-tests all esp32p4 --toolchain stable
+          cargo xtask build compile-tests all esp32h2 --toolchain stable
+
+      # Build the examples/qa/tests against the local registry. Gated on
+      # `release:registry:ci` so a release can opt out of this heavy check.
+      - name: try-build [examples/qa/tests]
+        if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'release:registry:ci') }}
+        shell: bash
+        run: |
+          # lints and docs are checked a couple of times already by other workflows
+          cargo xcheck ci esp32 --toolchain esp --steps=lp-examples,examples,qa-test,tests
+          cargo xcheck ci esp32s2 --toolchain esp --steps=lp-examples,examples,qa-test,tests
+          cargo xcheck ci esp32s3 --toolchain esp --steps=lp-examples,examples,qa-test,tests
+          cargo xcheck ci esp32s31 --toolchain stable --steps=lp-examples,examples,qa-test,tests
+          cargo xcheck ci esp32c2 --toolchain stable --steps=lp-examples,examples,qa-test,tests
+          cargo xcheck ci esp32c3 --toolchain stable --steps=lp-examples,examples,qa-test,tests
+          cargo xcheck ci esp32c5 --toolchain stable --steps=lp-examples,examples,qa-test,tests
+          cargo xcheck ci esp32c6 --toolchain stable --steps=lp-examples,examples,qa-test,tests
+          cargo xcheck ci esp32c61 --toolchain stable --steps=lp-examples,examples,qa-test,tests
+          cargo xcheck ci esp32p4 --toolchain stable --steps=lp-examples,examples,qa-test,tests
+          cargo xcheck ci esp32h2 --toolchain stable --steps=lp-examples,examples,qa-test,tests

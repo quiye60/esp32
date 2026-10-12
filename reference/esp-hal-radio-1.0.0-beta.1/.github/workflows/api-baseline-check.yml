@@ -1,0 +1,38 @@
+name: API Baseline Check
+
+on:
+  workflow_call:
+    inputs:
+      packages:
+        description: "Space-separated list of packages with breaking changes to exclude"
+        required: false
+        type: string
+        default: ""
+
+env:
+  CARGO_TERM_COLOR: always
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  baseline-check:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-toolchains
+        with:
+          xtensa: "true"
+          riscv: "true"
+
+      - name: Semver-Check
+        run: |
+          cargo xcheck semver-check download-baselines
+          PACKAGES="${{ inputs.packages }}"
+          if [ -n "$PACKAGES" ]; then
+            cargo xcheck semver-check --exclude-packages "$PACKAGES" check
+          else
+            cargo xcheck semver-check check
+          fi

@@ -1,0 +1,16 @@
+{
+  "server": {
+    "url": "ws://10.10.162.138:3000",
+    "token": ""
+  },
+  "targets": [
+    {
+      "chip": "nRF52832_xxAA",
+      "probe": "1366:1015:000682808385", 
+      "labels": {
+        "target": "nrf52",
+        "board": "nrf52dk"
+      }
+    }
+  ]
+}

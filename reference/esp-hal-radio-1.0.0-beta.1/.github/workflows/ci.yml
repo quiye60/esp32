@@ -1,0 +1,575 @@
+# NOTE:
+#
+# Adding support for a new chip to `esp-hal` only needs `.github/chips.json`,
+# which feeds the 'esp-hal', 'docs' and 'msrv' jobs, the toolchain setup
+# actions, ci-nightly, binary-size and the HIL matrix.
+#
+# `ci-toolchain` picks the 'esp-hal' build group the chip lands in, which is
+# also how the load is balanced across the runners. Give the chip a
+# `hil-runner` (and `hil-radio-runner`) once it has a board on the rack;
+# without one it is built but not HIL tested.
+
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
+  merge_group:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  DEFMT_LOG: trace
+  PROBE_RS_CONFIG_PRESET: local-hil
+
+# Cancel any currently running workflows from the same PR, branch, or
+# tag when a new workflow is triggered.
+#
+# https://stackoverflow.com/a/66336834
+concurrency:
+  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+
+jobs:
+  # Centralized entry point — fetches labels once, decides which downstream
+  # jobs and reusable workflows run.  Every other job/workflow in this file
+  # gates on `calculate` outputs.
+  # Draft PRs run no CI at all: every other job needs `calculate`, so skipping
+  # it skips them too. Closed and merged PRs are skipped the same way, since
+  # label events fire on them as well.
+  calculate:
+    if: >
+      !github.event.pull_request.draft &&
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.state != 'closed')
+    runs-on: ubuntu-latest
+    outputs:
+      labels: ${{ steps.labels.outputs.labels }}
+      packages: ${{ steps.labels.outputs.packages }}
+      run-build: ${{ steps.decide.outputs.run-build }}
+      run-docs: ${{ steps.decide.outputs.run-docs }}
+      run-msrv: ${{ steps.decide.outputs.run-msrv }}
+      run-host-tests: ${{ steps.decide.outputs.run-host-tests }}
+      run-hil: ${{ steps.decide.outputs.run-hil }}
+      run-changelog: ${{ steps.decide.outputs.run-changelog }}
+      run-semver-check: ${{ steps.decide.outputs.run-semver-check }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Get labels
+        id: labels
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" || "${{ github.event_name }}" == "pull_request_target" ]]; then
+            LABELS=$(printf "%b" "${{ join(github.event.pull_request.labels.*.name, '\n') }}")
+          elif [[ "${{ github.event_name }}" == "merge_group" ]]; then
+            COMMIT_MSG=$(git log -1 --pretty=%B)
+            PR_NUMBER=$(echo "$COMMIT_MSG" | grep -o "#[0-9]*" | grep -o "[0-9]*" || true)
+            if [ -n "$PR_NUMBER" ]; then
+              LABELS=$(gh pr view "$PR_NUMBER" --json labels --jq '.labels[].name' 2>/dev/null || true)
+            fi
+          fi
+
+          PACKAGES=""
+          if [ -n "$LABELS" ]; then
+            PACKAGES=$(printf '%s\n' "$LABELS" \
+              | { grep -oP '(?<=^breaking-change-)[a-z0-9-]+$' || true; } \
+              | tr '\n' ' ' | xargs)
+          fi
+
+          LABELS_SPACE=$(echo "$LABELS" | tr '\n' ' ' | xargs)
+
+          echo "labels=$LABELS_SPACE" >> "$GITHUB_OUTPUT"
+          echo "packages=$PACKAGES" >> "$GITHUB_OUTPUT"
+
+          echo "Detected labels: $LABELS_SPACE"
+          echo "Detected packages: $PACKAGES"
+
+      - name: Decide what to run
+        id: decide
+        env:
+          LABELS: ${{ steps.labels.outputs.labels }}
+        run: |
+          BUILD=true; DOCS=true; MSRV=true; HOST=true
+          CHANGELOG=true; SEMVER=true
+          HIL=false
+
+          if [[ "${{ github.event_name }}" == "merge_group" ]]; then
+            BUILD=false
+            HIL=true
+          fi
+
+          # `skip-ci-non-code-change` only skips building/testing; API checks (semver) still run.
+          # Use the dedicated `skip-semver-checks` label to skip semver checks.
+          if echo "$LABELS" | grep -qw 'skip-ci-non-code-change'; then
+            BUILD=false; DOCS=false; MSRV=false; HOST=false
+            HIL=false
+          fi
+          if echo "$LABELS" | grep -qw 'skip-semver-checks'; then SEMVER=false; fi
+          if echo "$LABELS" | grep -qw 'skip-changelog'; then CHANGELOG=false; fi
+
+          for pair in \
+            "run-build=$BUILD" \
+            "run-docs=$DOCS" \
+            "run-msrv=$MSRV" \
+            "run-host-tests=$HOST" \
+            "run-hil=$HIL" \
+            "run-changelog=$CHANGELOG" \
+            "run-semver-check=$SEMVER"; do
+            echo "$pair" >> "$GITHUB_OUTPUT"
+          done
+
+          echo "Decision: build=$BUILD docs=$DOCS msrv=$MSRV host=$HOST hil=$HIL changelog=$CHANGELOG semver=$SEMVER"
+
+  # Merge freeze — see documentation/CONTRIBUTING.md.
+  #
+  # Lives here so that `ci-result` carries it: a check that never reports on
+  # `pull_request` cannot be a required check on its own, GitHub would wait for
+  # it forever. Outside the merge queue this only asks whether a freeze issue is
+  # open and exits, so it runs on every event to keep `hil` reachable.
+  merge-freeze-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: write
+    steps:
+      # Base branch, never the queue branch: a queued pull request must not be
+      # able to rewrite the gate that judges it.
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.merge_group.base_ref || github.base_ref }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      # A base branch without the script is a base branch without merge
+      # freezes, so there is nothing to enforce. This is not only for
+      # bootstrapping, backport pull requests target `esp-hal-x.y.x` branches
+      # that were cut before the gate existed, and CI runs on those too.
+      - name: Look for the gate
+        id: gate
+        env:
+          BASE_REF: ${{ github.event.merge_group.base_ref || github.base_ref }}
+        run: |
+          if [ -f .github/scripts/merge-freeze.js ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No merge freeze gate on $BASE_REF, nothing to enforce."
+          fi
+
+      - uses: actions/github-script@v8
+        if: steps.gate.outputs.present == 'true'
+        with:
+          script: |
+            const { gate } = require('./.github/scripts/merge-freeze.js');
+            await gate({ github, context, core });
+
+  # --------------------------------------------------------------------------
+  # Build Packages
+  esp-hal:
+    needs: calculate
+    if: needs.calculate.outputs.run-build == 'true'
+    runs-on: macos-m1-self-hosted
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CI: 1
+      SSID: SSID
+      PASSWORD: PASSWORD
+      STATIC_IP: 1.1.1.1
+      GATEWAY_IP: 1.1.1.1
+      HOST_IP: 1.1.1.1
+
+    strategy:
+      matrix:
+        # Which chips each toolchain builds comes from `ci-toolchain` in
+        # .github/chips.json, which is also how the runner load is balanced.
+        toolchain: [esp, stable]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-toolchains
+        with:
+          xtensa: ${{ matrix.toolchain == 'esp' }}
+          riscv: "true"
+
+      - name: Setup cargo-batch
+        run: |
+          if ! command -v cargo-batch &> /dev/null; then
+              cargo install --git https://github.com/embassy-rs/cargo-batch cargo --bin cargo-batch --locked --force
+          fi
+
+      - name: Resolve chips for this toolchain
+        id: chips
+        shell: bash
+        run: |
+          echo "chips=$(jq -r --arg t '${{ matrix.toolchain }}' \
+            '[.[] | select(."ci-toolchain" == $t) | .soc] | join(" ")' .github/chips.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and Check
+        shell: bash
+        env:
+          CHIPS: ${{ steps.chips.outputs.chips }}
+          TOOLCHAIN: ${{ matrix.toolchain }}
+        run: |
+          # lints and docs are checked separately
+          for chip in $CHIPS; do
+            cargo xcheck ci "$chip" --toolchain "$TOOLCHAIN" --no-lint --no-docs
+          done
+
+  docs:
+    needs: calculate
+    if: needs.calculate.outputs.run-docs == 'true'
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        group:
+          - xtensa
+          - riscv
+
+    steps:
+      - uses: actions/checkout@v6
+
+      # Docs mix toolchains: Xtensa builds on the MSRV pin while
+      # RISC-V builds on stable.
+      - uses: ./.github/actions/setup-toolchains
+        with:
+          channel: msrv
+          xtensa: "true"
+
+      - uses: ./.github/actions/setup-toolchains
+        with:
+          riscv: "true"
+
+      # Install the Rust nightly toolchain for RISC-V devices:
+      - uses: ./.github/actions/setup-nightly
+        with:
+          targets: all
+          components: rust-src
+          alias: "true"
+
+      # The xtensa and riscv build disjoint chip sets, so give them
+      # separate cache entries
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: docs-${{ matrix.group }}
+          # Every merge_group run gets a unique ephemeral ref, so a cache saved
+          # there can never be restored. Restore everywhere, save elsewhere.
+          save-if: ${{ github.event_name != 'merge_group' }}
+
+      - name: Resolve chips for this group
+        id: chips
+        shell: bash
+        run: |
+          echo "chips=$(jq -r --arg a '${{ matrix.group }}' \
+            '[.[] | select(.arch == $a) | .soc] | join(",")' .github/chips.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Build docs
+        shell: bash
+        env:
+          CHIPS: ${{ steps.chips.outputs.chips }}
+        run: cargo xtask docs ${CHIPS//,/ }
+
+      - name: Run doc tests
+        shell: bash
+        env:
+          CHIPS: ${{ steps.chips.outputs.chips }}
+        run: |
+          for chip in ${CHIPS//,/ }; do
+            cargo xtask doc-tests "$chip"
+          done
+
+  # --------------------------------------------------------------------------
+  # MSRV
+
+  msrv:
+    needs: calculate
+    if: needs.calculate.outputs.run-msrv == 'true'
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        group:
+          - xtensa
+          - riscv
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - id: toolchains
+        uses: ./.github/actions/setup-toolchains
+        with:
+          channel: msrv
+          xtensa: ${{ matrix.group == 'xtensa' }}
+          riscv: ${{ matrix.group == 'riscv' }}
+          riscv-extra-targets: x86_64-unknown-linux-gnu
+          riscv-components: rust-src,clippy
+
+      - name: esp toolchain checks
+        if: matrix.group == 'xtensa'
+        run: rustc +esp --version --verbose
+
+      - name: Stable toolchain checks
+        if: matrix.group == 'riscv'
+        run: rustc +${{ steps.toolchains.outputs.riscv-toolchain }} --version --verbose
+
+      # The xtensa and riscv lint disjoint chip sets under different
+      # toolchains, so keep their caches separate.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv-${{ matrix.group }}
+          save-if: ${{ github.event_name != 'merge_group' }}
+
+      - name: Resolve chips for this group
+        id: chips
+        run: |
+          echo "chips=$(jq -r --arg a '${{ matrix.group }}' \
+            '[.[] | select(.arch == $a) | .soc] | join(",")' .github/chips.json)" >> "$GITHUB_OUTPUT"
+
+      - name: msrv lint (esp-hal)
+        env:
+          CHIPS: ${{ steps.chips.outputs.chips }}
+        run: |
+          cargo xtask lint ${CHIPS//,/ } \
+            --toolchain ${{ matrix.group == 'xtensa' && 'esp' || steps.toolchains.outputs.riscv-toolchain }}
+
+  # --------------------------------------------------------------------------
+  # Xtensa LLD linking
+  #
+  # Verifies that the Xtensa examples link successfully with LLD (`rust-lld`)
+  # instead of GNU LD. RISC-V already links with `rust-lld`, so only the
+  # Xtensa chips are exercised here. Kept intentionally small.
+  #
+  # The radio examples (embassy_dhcp for Wi-Fi, bas_peripheral for BLE) link
+  # the Espressif blobs and exercise the per-archive `.text` grouping that
+  # keeps L32R literal loads in reach under LLD, so they are included to guard
+  # that layout against regressions.
+  xtensa-lld:
+    needs: calculate
+    if: needs.calculate.outputs.run-build == 'true'
+    runs-on: ubuntu-latest
+
+    env:
+      # Link with LLD rather than GNU LD. Setting `RUSTFLAGS` overrides the
+      # `rustflags` (and thus the linker selection) from each example's
+      # `.cargo/config.toml`.
+      RUSTFLAGS: "-C link-arg=-Tlinkall.x -C linker=rust-lld"
+    steps:
+      - uses: actions/checkout@v6
+
+      # Uses the same pin as the `esp-hal` build job above, so the LLD linking
+      # test exercises the same compiler as the rest of CI.
+      - uses: ./.github/actions/setup-toolchains
+        with:
+          xtensa: "true"
+
+      - name: Build hello_world with LLD
+        working-directory: examples/hello_world
+        run: |
+          cargo +esp build --release --target xtensa-esp32-none-elf --features esp32
+          cargo +esp build --release --target xtensa-esp32s2-none-elf --features esp32s2
+          cargo +esp build --release --target xtensa-esp32s3-none-elf --features esp32s3
+
+      - name: Build embassy_dhcp with LLD
+        working-directory: examples/wifi/embassy_dhcp
+        run: |
+          cargo +esp build --release --target xtensa-esp32-none-elf --features esp32
+          cargo +esp build --release --target xtensa-esp32s2-none-elf --features esp32s2
+          cargo +esp build --release --target xtensa-esp32s3-none-elf --features esp32s3
+
+      - name: Build bas_peripheral (trouble BLE) with LLD
+        working-directory: examples/ble/bas_peripheral
+        run: |
+          cargo +esp build --release --target xtensa-esp32-none-elf --features esp32
+          cargo +esp build --release --target xtensa-esp32s3-none-elf --features esp32s3
+
+  # --------------------------------------------------------------------------
+  # host tests
+
+  host-tests:
+    needs: calculate
+    if: needs.calculate.outputs.run-host-tests == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # Some of the configuration items in 'rustfmt.toml' require the 'nightly'
+      # release channel, MIRI is only available in nightly
+      - uses: ./.github/actions/setup-nightly
+        with:
+          components: rustfmt,miri
+          alias: "true"
+
+      # xtask funnels every package it drives into the root `target`, but the
+      # `extras` crates are built directly and keep their own target dirs.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: host-tests
+          save-if: ${{ github.event_name != 'merge_group' }}
+          workspaces: |
+            . -> target
+            extras/bench-server -> target
+            extras/esp-wifishark -> target
+            extras/ieee802154-sniffer -> target
+
+      # Run xtask tests
+      - name: Run xtask tests
+        run: cd xtask && cargo test --features release
+
+      # Check the formatting of all packages:
+      - run: cargo xtask fmt --check
+
+      # Check metadata generation for all packages:
+      - run: cargo update-metadata --check
+
+      # Enforce esp-rom-sys dependency requirement policy:
+      - run: cargo xrel-check check-rom-sys-policy
+
+      # Run host tests for all applicable packages:
+      - run: cargo xtask host-tests
+
+      # Check for unused dependencies
+      - name: Machete
+        uses: bnjbvr/cargo-machete@v0.9.2
+        with:
+          args: >
+            esp-alloc
+            esp-backtrace
+            esp-bootloader-esp-idf
+            esp-config
+            esp-hal
+            esp-hal-procmacros
+            esp-lp-hal
+            esp-metadata
+            esp-phy
+            esp-println
+            esp-radio
+            esp-radio-rtos-driver
+            esp-riscv-rt
+            esp-rom-sys
+            esp-rtos
+            esp-storage
+            esp-sync
+            examples
+            extras
+            xtask
+
+      # Install dependencies for building the extra crates on ubuntu
+      - name: Install dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get -y install musl-tools libudev-dev pkg-config
+      # Build the extra crates
+      - name: Build the bench-server
+        run: cd extras/bench-server && cargo build
+      - name: Build esp-wifishark
+        run: cd extras/esp-wifishark && cargo build
+      - name: Build ieee802154-sniffer
+        run: cd extras/ieee802154-sniffer && cargo build
+
+  # --------------------------------------------------------------------------
+  # Check links in .rs, .md, and .toml files
+  #
+  # Deliberately absent from `ci-result` below.
+
+  link-check:
+    needs: calculate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: lycheeverse/lychee-action@v2
+        with:
+          args: >
+            --verbose
+            --no-progress
+            --format detailed
+            --max-concurrency 4
+            --retry-wait-time 5
+            --max-retries 10
+            --accept "200,301,302"
+            --exclude-path ".*/target/.*|.*/static\.files/.*|.*/docs/.*"
+            --remap "https://github.com/${{ github.repository }}/(?:blob|tree)/[^/]+/(.+) file://$GITHUB_WORKSPACE/\$1"
+            './**/*.rs'
+            './**/*.md'
+            './**/*.toml'
+
+  # --------------------------------------------------------------------------
+  # Reusable workflow calls — gated by calculate outputs
+
+  changelog:
+    needs: calculate
+    if: >
+      github.event_name == 'pull_request' &&
+      !github.event.pull_request.draft &&
+      needs.calculate.outputs.run-changelog == 'true'
+    uses: ./.github/workflows/changelog.yml
+    with:
+      pr-number: ${{ github.event.pull_request.number }}
+    secrets: inherit
+
+  semver-check:
+    needs: calculate
+    if: needs.calculate.outputs.run-semver-check == 'true'
+    uses: ./.github/workflows/api-baseline-check.yml
+    with:
+      packages: ${{ needs.calculate.outputs.packages }}
+    secrets: inherit
+
+  # --------------------------------------------------------------------------
+  # HIL — build jobs gate artifacts; hil-gate gates device runs (≥50% rule).
+
+  # `merge-freeze-gate` is a dependency so that a frozen-out queue entry never
+  # occupies the device runners.
+  hil:
+    needs: [calculate, merge-freeze-gate]
+    if: needs.calculate.outputs.run-hil == 'true'
+    uses: ./.github/workflows/hil.yml
+    with:
+      chips: all
+      package: all
+    secrets: inherit
+
+  # --------------------------------------------------------------------------
+  # Gate job for branch protection
+  #
+  # Branch protection should require this single job instead of individual jobs.
+  # Skipped jobs (due to calculate outputs) are treated as success.
+  # Failed or cancelled jobs cause this gate to fail.
+  #
+  # The `hil` job is the reusable hil.yml workflow, so it covers test
+  # compilation and the runner tool as well; its hil-gate job blocks when ≥50%
+  # of executed hil-run matrix legs fail. hil-run-radio is informational only.
+  # merge-freeze-gate rejects queue entries while a merge freeze is in effect.
+  ci-result:
+    if: ${{ always() }}
+    needs:
+      # `calculate` gates everything below it, so a failure there leaves every
+      # other job `skipped` — which this gate treats as success. Depend on it
+      # directly, or a broken decision step passes CI without running any.
+      - calculate
+      - esp-hal
+      - docs
+      - msrv
+      - xtensa-lld
+      - host-tests
+      - changelog
+      - semver-check
+      - hil
+      - merge-freeze-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check CI results
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              echo "::error::One or more CI jobs failed or were cancelled"
+              exit 1
+            fi
+          done
+          echo "All CI checks passed (or were correctly skipped)"

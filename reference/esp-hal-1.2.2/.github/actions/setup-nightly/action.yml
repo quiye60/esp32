@@ -1,0 +1,43 @@
+name: Setup nightly
+description: Install the repo-wide pinned Rust nightly toolchain, with an optional `nightly` alias.
+
+inputs:
+  targets:
+    description: Comma-separated list of target triples to install.
+    required: false
+    default: ""
+  components:
+    description: Comma-separated list of toolchain components to install.
+    required: false
+    default: rust-src
+  alias:
+    description: When "true", symlink the pinned toolchain to the reserved `nightly` name so `cargo +nightly` resolves to the pin.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    # Single source of truth for the nightly version used across all workflows.
+    # Set to a specific version to work around a compiler issue.
+    - id: version
+      shell: bash
+      run: echo "nightly=nightly" >> "$GITHUB_OUTPUT"
+
+    - uses: dtolnay/rust-toolchain@v1
+      with:
+        toolchain: ${{ steps.version.outputs.nightly }}
+        targets: ${{ inputs.targets }}
+        components: ${{ inputs.components }}
+
+    # xtask docs/doc-tests call `cargo +nightly`; make that name resolve to the pin.
+    # `rustup toolchain link` rejects the reserved name `nightly`, so symlink directly.
+    - name: Alias pinned nightly as nightly
+      if: inputs.alias == 'true'
+      shell: bash
+      run: |
+        ver='${{ steps.version.outputs.nightly }}'
+        [ "$ver" = nightly ] && exit 0
+        host=$(rustc +"$ver" -vV | sed -n 's/^host: //p')
+        toolchains="$(rustup show home)/toolchains"
+        ln -sfn "$toolchains/$ver-$host" "$toolchains/nightly-$host"

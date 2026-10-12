@@ -1,0 +1,20 @@
+# Keep compilation settings in this file and user/runtime settings in `esp-config.toml`.
+include = ["esp-config.toml"]
+
+[target.xtensa-esp32s3-none-elf]
+# cargo run 的 runner：cargo 会自动把编译出来的 ELF 路径追加到这条命令末尾，
+# 所以这里**不要**写死路径。实际执行的命令就是：
+#   probe-rs run --chip=esp32s3 --preverify --always-print-stacktrace --no-location ./target/xtensa-esp32s3-none-elf/debug/esp-s3
+# （写死成 `probe-rs run ./target/.../esp-s3` 会变成两个位置参数，
+#   probe-rs 会报 "invoked with arguments exclusive to test mode"）
+runner = "probe-rs run --chip=esp32s3 --preverify --always-print-stacktrace --no-location"
+
+[build]
+rustflags = [
+  "-C", "link-arg=-nostartfiles",
+]
+
+target = "xtensa-esp32s3-none-elf"
+
+[unstable]
+build-std = ["alloc", "core"]

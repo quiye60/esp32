@@ -1,0 +1,20 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Run esp-s3" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
+    <option name="buildProfileId" value="dev" />
+    <option name="command" value="run" />
+    <option name="workingDirectory" value="file://$PROJECT_DIR$" />
+    <envs>
+      <env name="PATH" value="$USER_HOME$/.rustup/toolchains/esp/xtensa-esp-elf/esp-15.2.0_20250920/xtensa-esp-elf/bin:$USER_HOME$/.local/bin:$USER_HOME$/.cargo/bin:$USER_HOME$/.npm-global/bin:$USER_HOME$/.local/share/st/stm32cubeclt_1.21.0:$USER_HOME$/.local/share/st/stm32cubeclt_1.21.0/STM32CubeProgrammer/bin:$USER_HOME$/.local/share/st/stm32cubeclt_1.21.0/STLink-gdb-server/bin:$USER_HOME$/.local/share/st/stm32cubeclt_1.21.0/CMake/bin:$USER_HOME$/.local/share/st/stm32cubeclt_1.21.0/Ninja/bin:$USER_HOME$/.local/share/st/stm32cubeclt_1.21.0/st-arm-clang/bin:$USER_HOME$/.local/share/st/stm32cubeclt_1.21.0/GNU-tools-for-STM32/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/bin/site_perl:/usr/bin/vendor_perl:/usr/bin/core_perl:$USER_HOME$/.local/share/JetBrains/Toolbox/scripts" />
+    </envs>
+    <option name="emulateTerminal" value="true" />
+    <option name="channel" value="DEFAULT" />
+    <option name="requiredFeatures" value="true" />
+    <option name="allFeatures" value="false" />
+    <option name="withSudo" value="false" />
+    <option name="buildTarget" value="REMOTE" />
+    <option name="backtrace" value="SHORT" />
+    <option name="isRedirectInput" value="false" />
+    <option name="redirectInputPath" value="" />
+    <method v="2" />
+  </configuration>
+</component>

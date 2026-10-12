@@ -1,0 +1,141 @@
+use core::ops::Range;
+
+use embassy_futures::join::join;
+use embassy_time::{Duration, Timer};
+use embedded_storage_async::nor_flash::NorFlash;
+use sequential_storage::cache::NoCache;
+use sequential_storage::map::{MapConfig, MapStorage, PostcardValue};
+use serde::{Deserialize, Serialize};
+use trouble_host::prelude::*;
+
+/// Max number of connections
+const CONNECTIONS_MAX: usize = 1;
+
+/// Max number of L2CAP channels.
+const L2CAP_CHANNELS_MAX: usize = 3; // Signal + att + CoC
+
+#[derive(Serialize, Deserialize)]
+struct StoredBondInformation(BondInformation);
+impl<'a> PostcardValue<'a> for StoredBondInformation {}
+
+pub async fn run<C, S>(controller: C, storage: &mut S, storage_range: Range<u32>)
+where
+    C: Controller,
+    S: NorFlash,
+{
+    // Using a fixed "random" address can be useful for testing. In real scenarios, one would
+    // use e.g. the MAC 6 byte array as the address (how to get that varies by the platform).
+    let address: Address = Address::random([0xff, 0x8f, 0x28, 0x05, 0xe4, 0xff]);
+    info!("Our address = {:?}", address);
+
+    let mut resources: HostResources<_, DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> = HostResources::new();
+    let stack = trouble_host::new(controller, &mut resources)
+        .set_random_address(address)
+        .build();
+
+    let mut map_storage = MapStorage::<(), _, _>::new(storage, MapConfig::new(storage_range), NoCache::new());
+    let mut data_buffer = [0; 64];
+    let mut has_bond_info =
+        if let Some(StoredBondInformation(bond_info)) = map_storage.fetch_item(&mut data_buffer, &()).await.unwrap() {
+            info!("Bond stored. Adding to stack.");
+            stack.add_bond_information(bond_info).unwrap();
+            true
+        } else {
+            info!("No bond stored.");
+            false
+        };
+
+    let mut runner = stack.runner();
+    let mut central = stack.central();
+
+    // NOTE: Modify this to match the address of the peripheral you want to connect to.
+    // Currently it matches the address used by the peripheral examples
+    let target: Address = Address::random([0xff, 0x8f, 0x08, 0x05, 0xe4, 0xff]);
+
+    let config = ConnectConfig {
+        connect_params: Default::default(),
+        scan_config: ScanConfig {
+            filter_accept_list: &[target],
+            ..Default::default()
+        },
+    };
+
+    info!("Scanning for peripheral...");
+    let _ = join(runner.run(), async {
+        info!("Connecting");
+
+        let conn = central.connect(&config).await.unwrap();
+        // Allow bonding if a bond isn't already stored
+        conn.set_bondable(!has_bond_info).unwrap();
+        info!("Connected, creating gatt client");
+
+        #[cfg(feature = "security")]
+        {
+            conn.request_security().unwrap();
+            loop {
+                match conn.next().await {
+                    ConnectionEvent::PairingComplete { security_level, bond } => {
+                        info!("Pairing complete: {:?}", security_level);
+                        if let Some(bond) = bond {
+                            map_storage
+                                .store_item(&mut data_buffer, &(), &StoredBondInformation(bond))
+                                .await
+                                .unwrap();
+                            has_bond_info = true;
+                        }
+                        break;
+                    }
+                    ConnectionEvent::PairingFailed(err) => {
+                        error!("Pairing failed: {:?}", err);
+                        break;
+                    }
+                    ConnectionEvent::Disconnected { reason } => {
+                        error!("Disconnected: {:?}", reason);
+                        break;
+                    }
+                    ConnectionEvent::RequestConnectionParams(req) => req.accept(None, &stack).await.unwrap(),
+                    _ => {}
+                }
+            }
+        }
+
+        let client = GattClient::<C, DefaultPacketPool, 10>::new(&stack, &conn)
+            .await
+            .unwrap();
+
+        let _ = join(client.task(), async {
+            info!("Looking for battery service");
+            let services = client.services_by_uuid(&Uuid::new_short(0x180f)).await.unwrap();
+            let service = services.first().unwrap().clone();
+
+            info!("Looking for value handle");
+            let c: Characteristic<u8> = client
+                .characteristic_by_uuid(&service, &Uuid::new_short(0x2a19))
+                .await
+                .unwrap();
+
+            info!("Subscribing notifications");
+            let mut listener = client.subscribe(&c, false).await.unwrap();
+
+            let _ = join(
+                async {
+                    loop {
+                        let mut data = [0; 1];
+                        client.read_characteristic(&c, &mut data[..]).await.unwrap();
+                        info!("Read value: {}", data[0]);
+                        Timer::after(Duration::from_secs(10)).await;
+                    }
+                },
+                async {
+                    loop {
+                        let data = listener.next().await;
+                        info!("Got notification: {:?} (val: {})", data.as_ref(), data.as_ref()[0]);
+                    }
+                },
+            )
+            .await;
+        })
+        .await;
+    })
+    .await;
+}

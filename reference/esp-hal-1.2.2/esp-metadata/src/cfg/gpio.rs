@@ -1,0 +1,1067 @@
+//! This module contains configuration used in [device.gpio], as well as
+//! functions that generate code for esp-hal.
+
+use std::{
+    collections::{BTreeMap, HashSet},
+    str::FromStr,
+};
+
+use indexmap::IndexMap;
+use proc_macro2::{Ident, TokenStream};
+use quote::{format_ident, quote};
+
+use crate::{
+    cfg::{GenericProperty, Value},
+    generate_for_each_macro,
+    number,
+};
+
+/// Additional properties (besides those defined in cfg.rs) for [device.gpio].
+#[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GpioPinsAndSignals {
+    /// The list of GPIO pins and their properties.
+    pub pins: Vec<PinConfig>,
+
+    /// The list of peripheral input signals.
+    pub input_signals: Vec<IoMuxSignal>,
+
+    /// The list of peripheral output signals.
+    pub output_signals: Vec<IoMuxSignal>,
+}
+
+impl GenericProperty for GpioPinsAndSignals {
+    fn cfgs(&self) -> Option<Vec<String>> {
+        self.pins
+            .iter()
+            .any(|p| p.is_xtal32k())
+            .then(|| vec!["soc_has_xtal32k_pads".to_string()])
+    }
+}
+
+/// Possible special cases that may affect pin availability or functionality.
+///
+/// Some of these are explicitly encoded in the TOMLs, others are inferred from the pin alternate
+/// function list.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PinLimitation {
+    /// Strapping pin, signal level needs to be carefully set during boot.
+    Strapping,
+
+    /// Pin is used to interface with SPI flash.
+    SpiFlash,
+
+    /// Pin is used to interface with Octal SPI flash.
+    OctalFlash,
+
+    /// Pin is used to interface with SPI PSRAM.
+    SpiPsram,
+
+    /// Pin is used to interface with Octal SPI PSRAM.
+    OctalPsram,
+
+    /// Pin is only available on ESP32-PICO-V3.
+    Esp32PicoV3,
+
+    /// The pin has no output stage.
+    InputOnly,
+
+    /// Default UART pins.
+    BootloaderUart,
+
+    /// Debugger pins.
+    Jtag,
+
+    /// USB Serial/JTAG debugger pins.
+    UsbJtag,
+}
+
+impl std::fmt::Display for PinLimitation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PinLimitation::Strapping => write!(
+                f,
+                "This pin is a strapping pin, it determines how the chip boots."
+            ),
+            PinLimitation::SpiFlash => {
+                write!(
+                    f,
+                    "This pin may be reserved for interfacing with SPI flash."
+                )
+            }
+            PinLimitation::OctalFlash => {
+                write!(
+                    f,
+                    "This pin may be reserved for interfacing with Octal SPI flash."
+                )
+            }
+            PinLimitation::SpiPsram => {
+                write!(
+                    f,
+                    "This pin may be reserved for interfacing with SPI PSRAM."
+                )
+            }
+            PinLimitation::OctalPsram => {
+                write!(
+                    f,
+                    "This pin may be reserved for interfacing with Octal SPI PSRAM."
+                )
+            }
+            PinLimitation::Esp32PicoV3 => write!(f, "This pin is only available on ESP32-PICO-V3."),
+            PinLimitation::InputOnly => write!(f, "This pin can only be used as an input."),
+            PinLimitation::BootloaderUart => {
+                write!(
+                    f,
+                    "By default, this pin is used by the UART programming interface."
+                )
+            }
+            PinLimitation::Jtag => {
+                write!(
+                    f,
+                    "These pins may be used to debug the chip using an external JTAG debugger."
+                )
+            }
+            PinLimitation::UsbJtag => {
+                write!(f, "These pins may be used to debug the chip using USB.")
+            }
+        }
+    }
+}
+
+/// Properties of a single GPIO pin.
+#[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PinConfig {
+    /// The GPIO pin number.
+    pub pin: usize,
+
+    /// Available IO MUX functions for this pin.
+    #[serde(default)]
+    pub functions: FunctionMap,
+
+    /// Available analog functions for this pin.
+    #[serde(default)]
+    pub analog: AnalogMap,
+
+    /// Available LP IO functions for this pin.
+    #[serde(default)]
+    pub lp: LowPowerMap,
+
+    /// Lists cases where the GPIO needs special attention.
+    #[serde(default)]
+    pub limitations: Vec<PinLimitation>,
+}
+
+impl PinConfig {
+    /// Returns `true` if this pin is wired to one of the 32 kHz crystal (XTAL32K) pads.
+    pub(crate) fn is_xtal32k(&self) -> bool {
+        (0..AnalogMap::COUNT)
+            .filter_map(|af| self.analog.get(af))
+            .any(|signal| matches!(signal, "XTAL_32K_P" | "XTAL_32K_N"))
+    }
+
+    pub(crate) fn limitations(&self) -> Vec<PinLimitation> {
+        let mut limitations = self.limitations.clone();
+
+        // Resolve implicit limitations - based on pin alternate functions
+        let implicit: &[(&[&str], PinLimitation)] = &[
+            (&["MTMS", "MTCK", "MTDO", "MTDI"], PinLimitation::Jtag),
+            (&["USJ_DP", "USJ_DM"], PinLimitation::UsbJtag),
+            (&["U0TXD", "U0RXD"], PinLimitation::BootloaderUart),
+        ];
+
+        let max = usize::max(FunctionMap::COUNT, AnalogMap::COUNT);
+        for i in 0..max {
+            for (pins, limitation) in implicit.iter() {
+                let mut consider = |func| {
+                    if pins.contains(&func) && !limitations.contains(limitation) {
+                        limitations.push(*limitation);
+                    }
+                };
+
+                if let Some(func) = self.functions.get(i) {
+                    consider(func);
+                }
+                if let Some(func) = self.analog.get(i) {
+                    consider(func);
+                }
+            }
+        }
+
+        limitations
+    }
+}
+
+/// Available alternate functions for a given GPIO pin.
+///
+/// Alternate functions allow bypassing the GPIO matrix by selecting a different
+/// path in the multiplexers controlled by MCU_SEL.
+///
+/// Values of this struct correspond to rows in the IO MUX Pad List table.
+///
+/// Used in [device.gpio.pins[X].functions]. The GPIO function is not
+/// written here as that is common to all pins. The values are signal names
+/// listed in [device.gpio.input_signals] or [device.gpio.output_signals].
+/// `None` means the pin does not provide the given alternate function.
+#[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FunctionMap {
+    #[serde(rename = "0")]
+    af0: Option<String>,
+    #[serde(rename = "1")]
+    af1: Option<String>,
+    #[serde(rename = "2")]
+    af2: Option<String>,
+    #[serde(rename = "3")]
+    af3: Option<String>,
+    #[serde(rename = "4")]
+    af4: Option<String>,
+    #[serde(rename = "5")]
+    af5: Option<String>,
+}
+
+impl FunctionMap {
+    const COUNT: usize = 6;
+
+    /// Returns the signal associated with the nth alternate function.
+    ///
+    /// Note that not all alternate functions are defined. The number of the
+    /// GPIO function is available separately. Not all alternate function have
+    /// IO signals.
+    pub fn get(&self, af: usize) -> Option<&str> {
+        match af {
+            0 => self.af0.as_deref(),
+            1 => self.af1.as_deref(),
+            2 => self.af2.as_deref(),
+            3 => self.af3.as_deref(),
+            4 => self.af4.as_deref(),
+            5 => self.af5.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+/// Available analog functions for a given GPIO pin.
+#[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AnalogMap {
+    #[serde(rename = "0")]
+    af0: Option<String>,
+    #[serde(rename = "1")]
+    af1: Option<String>,
+    #[serde(rename = "2")]
+    af2: Option<String>,
+    #[serde(rename = "3")]
+    af3: Option<String>,
+    #[serde(rename = "4")]
+    af4: Option<String>,
+    #[serde(rename = "5")]
+    af5: Option<String>,
+}
+
+impl AnalogMap {
+    const COUNT: usize = 6;
+
+    /// Returns the signal associated with the nth alternate function.
+    pub fn get(&self, af: usize) -> Option<&str> {
+        match af {
+            0 => self.af0.as_deref(),
+            1 => self.af1.as_deref(),
+            2 => self.af2.as_deref(),
+            3 => self.af3.as_deref(),
+            4 => self.af4.as_deref(),
+            5 => self.af5.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+/// Available LP functions for a given GPIO pin.
+#[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LowPowerMap {
+    #[serde(rename = "0")]
+    af0: Option<String>,
+    #[serde(rename = "1")]
+    af1: Option<String>,
+    #[serde(rename = "2")]
+    af2: Option<String>,
+    #[serde(rename = "3")]
+    af3: Option<String>,
+    #[serde(rename = "4")]
+    af4: Option<String>,
+    #[serde(rename = "5")]
+    af5: Option<String>,
+}
+
+impl LowPowerMap {
+    const COUNT: usize = 6;
+
+    /// Returns the signal associated with the nth alternate function.
+    pub fn get(&self, af: usize) -> Option<&str> {
+        match af {
+            0 => self.af0.as_deref(),
+            1 => self.af1.as_deref(),
+            2 => self.af2.as_deref(),
+            3 => self.af3.as_deref(),
+            4 => self.af4.as_deref(),
+            5 => self.af5.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+/// An input or output peripheral signal. The names usually match the signal
+/// name in the Peripheral Signal List table, without the `in` or `out` suffix.
+/// If the `id` is `None`, the signal cannot be routed through the GPIO matrix.
+///
+/// If the TRM's signal table says "no" to Direct Input/Output via IO MUX, the
+/// signal does not have an Alternate Function and must be routed through the
+/// GPIO matrix.
+#[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IoMuxSignal {
+    /// The name of the signal.
+    pub name: String,
+
+    /// The numeric ID of the signal, if the signal can be routed through the
+    /// GPIO matrix.
+    #[serde(default)]
+    pub id: Option<usize>,
+}
+
+impl super::GpioProperties {
+    pub(super) fn computed_properties(&self) -> impl Iterator<Item = (&str, bool, Value)> {
+        let input_max = self
+            .pins_and_signals
+            .input_signals
+            .iter()
+            .filter_map(|s| s.id)
+            .max()
+            .unwrap_or(0) as u32;
+        let output_max = self
+            .pins_and_signals
+            .output_signals
+            .iter()
+            .filter_map(|s| s.id)
+            .max()
+            .unwrap_or(0) as u32;
+        let has_bank_1 = self.pins_and_signals.pins.len() > 32;
+
+        [
+            ("gpio.has_bank_1", false, Value::Boolean(has_bank_1)),
+            ("gpio.input_signal_max", false, Value::Number(input_max)),
+            ("gpio.output_signal_max", false, Value::Number(output_max)),
+        ]
+        .into_iter()
+    }
+}
+
+pub(crate) fn generate_gpios(
+    gpio: &super::GpioProperties,
+    lp_io: Option<&super::LpIoSignals>,
+) -> TokenStream {
+    let lp_output_signals: HashSet<&str> = lp_io
+        .map(|io| {
+            io.lp_output_signals
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    let lp_input_signals: HashSet<&str> = lp_io
+        .map(|io| {
+            io.lp_input_signals
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let pin_numbers = gpio
+        .pins_and_signals
+        .pins
+        .iter()
+        .map(|pin| number(pin.pin))
+        .collect::<Vec<_>>();
+
+    let pin_peris = gpio
+        .pins_and_signals
+        .pins
+        .iter()
+        .map(|pin| format_ident!("GPIO{}", pin.pin))
+        .collect::<Vec<_>>();
+
+    let pin_attrs = gpio
+        .pins_and_signals
+        .pins
+        .iter()
+        .map(|pin| {
+            // Input must come first
+            if pin.limitations.contains(&PinLimitation::InputOnly) {
+                vec![quote! { Input }, quote! {}]
+            } else {
+                vec![quote! { Input }, quote! { Output }]
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut lp_functions = vec![];
+    let mut expanded_lp_functions = IndexMap::new();
+    let mut analog_functions = vec![];
+    let mut expanded_analog_functions = IndexMap::new();
+    let mut iomux_functions = vec![];
+    let mut expanded_iomux_functions = IndexMap::new();
+
+    let pin_afs = gpio
+        .pins_and_signals
+        .pins
+        .iter()
+        .map(|pin| {
+            let mut input_afs = vec![];
+            let mut output_afs = vec![];
+
+            let pin_peri = format_ident!("GPIO{}", pin.pin);
+
+            for af in 0..FunctionMap::COUNT {
+                let Some(signal) = pin.functions.get(af) else {
+                    continue;
+                };
+
+                let af_variant = format_ident!("_{af}");
+                let mut found = false;
+
+                // Is the signal present among the input signals?
+                if let Some(signal) = gpio
+                    .pins_and_signals
+                    .input_signals
+                    .iter()
+                    .find(|s| s.name == signal)
+                {
+                    let signal_tokens = TokenStream::from_str(&signal.name).unwrap();
+                    input_afs.push(quote! { #af_variant => #signal_tokens });
+                    found = true;
+                }
+
+                // Is the signal present among the output signals?
+                if let Some(signal) = gpio
+                    .pins_and_signals
+                    .output_signals
+                    .iter()
+                    .find(|s| s.name == signal)
+                {
+                    let signal_tokens = TokenStream::from_str(&signal.name).unwrap();
+                    output_afs.push(quote! { #af_variant => #signal_tokens });
+                    found = true;
+                }
+
+                assert!(
+                    found,
+                    "Signal '{signal}' not found in input signals for GPIO pin {}",
+                    pin.pin
+                );
+            }
+
+            fn create_matchers_for_signal(
+                branches: &mut IndexMap<String, Vec<TokenStream>>,
+                pin_peri: &Ident,
+                signal: &str,
+                af: Option<&TokenStream>,
+                lp_groups: Option<&TokenStream>,
+            ) {
+                // Split "NAMEnumber" format fragments into the NAME and the number. The function
+                // returns `None` if the input string is not in this format. The NAME part can be
+                // empty (i.e. this function can return `Some("", number)`).
+                fn split_signal_with_number(fragment: &str) -> Option<(&str, usize)> {
+                    // Find the first character that is not a letter.
+                    let Some(breakpoint) = fragment
+                        .char_indices()
+                        .filter_map(|(idx, c)| if c.is_alphabetic() { None } else { Some(idx) })
+                        .next()
+                    else {
+                        // fragment only contains letters
+                        return None;
+                    };
+
+                    let number: usize = fragment[breakpoint..].parse().ok()?;
+
+                    Some((&fragment[..breakpoint], number))
+                }
+
+                let signal_name = TokenStream::from_str(signal).unwrap();
+
+                let full_signal = {
+                    // The signal name, with numbers replaced with placeholders
+                    let mut pattern = String::new();
+                    let mut numbers = vec![];
+
+                    let placeholders = ['n', 'm'];
+
+                    let mut separator = "";
+                    for fragment in signal.split('_') {
+                        if let Some((prefix, n)) = split_signal_with_number(fragment) {
+                            let placeholder = placeholders[numbers.len()];
+                            numbers.push(number(n));
+                            pattern = format!("{pattern}{separator}{prefix}{placeholder}")
+                        } else {
+                            pattern = format!("{pattern}{separator}{fragment}");
+                        };
+
+                        separator = "_";
+                    }
+
+                    if pattern == signal {
+                        None
+                    } else {
+                        let pattern = format_ident!("{pattern}");
+                        let tokens = quote! {
+                            ( #signal_name, #pattern #(, #numbers)* )
+                        };
+                        Some((pattern, tokens))
+                    }
+                };
+
+                if let Some((pattern, full_signal)) = full_signal {
+                    let pattern_name = pattern.to_string();
+                    branches
+                        .entry(pattern_name)
+                        .or_default()
+                        .push(if let Some(af) = af {
+                            if let Some(groups) = lp_groups {
+                                quote! { #full_signal, #pin_peri, #af, #groups }
+                            } else {
+                                quote! { #full_signal, #pin_peri, #af }
+                            }
+                        } else {
+                            quote! { #full_signal, #pin_peri }
+                        });
+                }
+            }
+
+            for af in 0..AnalogMap::COUNT {
+                if let Some(signal) = pin.analog.get(af) {
+                    let signal_name = TokenStream::from_str(signal).unwrap();
+                    analog_functions.push(quote! { #signal_name, #pin_peri });
+                    create_matchers_for_signal(
+                        &mut expanded_analog_functions,
+                        &pin_peri,
+                        signal,
+                        None,
+                        None,
+                    );
+                }
+            }
+
+            let mut lp_pin_input_afs = vec![];
+            let mut lp_pin_output_afs = vec![];
+
+            for af in 0..LowPowerMap::COUNT {
+                if let Some(signal) = pin.lp.get(af) {
+                    let signal_name = TokenStream::from_str(signal).unwrap();
+                    let signal_ident = format_ident!("{signal}");
+                    let af_variant = format_ident!("_{af}");
+                    lp_functions.push(quote! { #signal_name, #pin_peri, #af_variant });
+                    if lp_output_signals.contains(signal) {
+                        lp_pin_output_afs.push(quote! { #af_variant => #signal_ident });
+                    }
+                    if lp_input_signals.contains(signal) {
+                        lp_pin_input_afs.push(quote! { #af_variant => #signal_ident });
+                    }
+                }
+            }
+
+            let lp_groups = quote! {
+                ( #(#lp_pin_input_afs)* ) ( #(#lp_pin_output_afs)* )
+            };
+
+            for af in 0..LowPowerMap::COUNT {
+                if let Some(signal) = pin.lp.get(af) {
+                    let af_variant = format_ident!("_{af}");
+                    let af_tokens = quote! { #af_variant };
+                    create_matchers_for_signal(
+                        &mut expanded_lp_functions,
+                        &pin_peri,
+                        signal,
+                        Some(&af_tokens),
+                        Some(&lp_groups),
+                    );
+                }
+            }
+
+            for af in 0..FunctionMap::COUNT {
+                if let Some(signal) = pin.functions.get(af) {
+                    let signal_name = TokenStream::from_str(signal).unwrap();
+                    let af_variant = format_ident!("_{af}");
+                    let af_tokens = quote! { #af_variant };
+                    iomux_functions.push(quote! { #signal_name, #pin_peri, #af_variant });
+                    create_matchers_for_signal(
+                        &mut expanded_iomux_functions,
+                        &pin_peri,
+                        signal,
+                        Some(&af_tokens),
+                        None,
+                    );
+                }
+            }
+
+            quote! {
+                ( #(#input_afs)* ) ( #(#output_afs)* )
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let io_mux_accessor = if gpio.remap_iomux_pin_registers {
+        let iomux_pin_regs = gpio.pins_and_signals.pins.iter().map(|pin| {
+            let pin = number(pin.pin);
+            let accessor = format_ident!("gpio{pin}");
+
+            quote! { #pin => iomux.#accessor(), }
+        });
+
+        quote! {
+            pub(crate) fn io_mux_reg(gpio_num: u8) -> &'static crate::pac::io_mux::GPIO0 {
+                let iomux = crate::peripherals::IO_MUX::regs();
+                match gpio_num {
+                    #(#iomux_pin_regs)*
+                    other => panic!("GPIO {} does not exist", other),
+                }
+            }
+
+        }
+    } else {
+        quote! {
+            pub(crate) fn io_mux_reg(gpio_num: u8) -> &'static crate::pac::io_mux::GPIO {
+                crate::peripherals::IO_MUX::regs().gpio(gpio_num as usize)
+            }
+        }
+    };
+
+    let mut branches = vec![];
+    for (((n, p), af), attrs) in pin_numbers
+        .iter()
+        .zip(pin_peris.iter())
+        .zip(pin_afs.iter())
+        .zip(pin_attrs.iter())
+    {
+        branches.push(quote! {
+            #n, #p #af (#([#attrs])*)
+        })
+    }
+
+    let mut for_each_analog_branches = vec![("all", analog_functions.as_slice())];
+    let mut for_each_lp_branches = vec![("all", lp_functions.as_slice())];
+    let mut for_each_iomux_branches = vec![("all", iomux_functions.as_slice())];
+
+    for (pattern, signals) in expanded_analog_functions.iter() {
+        for_each_analog_branches.push((pattern.as_str(), signals.as_slice()));
+    }
+
+    for (pattern, signals) in expanded_lp_functions.iter() {
+        for_each_lp_branches.push((pattern.as_str(), signals.as_slice()));
+    }
+
+    for (pattern, signals) in expanded_iomux_functions.iter() {
+        for_each_iomux_branches.push((pattern.as_str(), signals.as_slice()));
+    }
+
+    let for_each_gpio = generate_for_each_macro("gpio", &[("all", &branches)]);
+
+    let for_each_analog = generate_for_each_macro("analog_function", &for_each_analog_branches);
+    let for_each_lp = generate_for_each_macro("lp_function", &for_each_lp_branches);
+    let for_each_iomux = generate_for_each_macro("iomux_function", &for_each_iomux_branches);
+
+    let input_signals = render_signals("InputSignal", &gpio.pins_and_signals.input_signals);
+    let output_signals = render_signals("OutputSignal", &gpio.pins_and_signals.output_signals);
+
+    let lp_functions_enum = render_lp_functions(gpio);
+
+    let gpio_for_signal = render_gpio_for_signal(gpio);
+
+    quote! {
+        /// This macro can be used to generate code for each `GPIOn` instance.
+        ///
+        /// For an explanation on the general syntax, as well as usage of individual/repeated
+        /// matchers, refer to [the crate-level documentation][crate#for_each-macros].
+        ///
+        /// This macro has one option for its "Individual matcher" case:
+        ///
+        /// Syntax: `($n:literal, $gpio:ident ($($digital_input_function:ident => $digital_input_signal:ident)*) ($($digital_output_function:ident => $digital_output_signal:ident)*) ($([$pin_attribute:ident])*))`
+        ///
+        /// Macro fragments:
+        ///
+        /// - `$n`: the number of the GPIO. For `GPIO0`, `$n` is 0.
+        /// - `$gpio`: the name of the GPIO.
+        /// - `$digital_input_function`: the number of the digital function, as an identifier (i.e. for function 0 this is `_0`).
+        /// - `$digital_input_function`: the name of the digital function, as an identifier.
+        /// - `$digital_output_function`: the number of the digital function, as an identifier (i.e. for function 0 this is `_0`).
+        /// - `$digital_output_function`: the name of the digital function, as an identifier.
+        /// - `$pin_attribute`: `Input` and/or `Output`, marks the possible directions of the GPIO. Bracketed so that they can also be matched as optional fragments. Order is always Input first.
+        ///
+        /// Example data: `(0, GPIO0 (_5 => EMAC_TX_CLK) (_1 => CLK_OUT1 _5 => EMAC_TX_CLK) ([Input] [Output]))`
+        #for_each_gpio
+
+        /// This macro can be used to generate code for each analog function of each GPIO.
+        ///
+        /// For an explanation on the general syntax, as well as usage of individual/repeated
+        /// matchers, refer to [the crate-level documentation][crate#for_each-macros].
+        ///
+        /// This macro has two options for its "Individual matcher" case:
+        ///
+        /// - `all`: `($signal:ident, $gpio:ident)` - simple case where you only need identifiers
+        /// - group: `(($signal:ident, $group:ident $(, $number:literal)+), $gpio:ident)` - expanded signal case, where you need the number(s) of a signal, or the general group to which the signal belongs. For example, in case of `ADC2_CH3` the expanded form looks like `(ADC2_CH3, ADCn_CHm, 2, 3)`.
+        ///
+        /// Macro fragments:
+        ///
+        /// - `$signal`: the name of the signal.
+        /// - `$group`: the name of the signal, with numbers replaced by placeholders. For `ADC2_CH3` this is `ADCn_CHm`.
+        /// - `$number`: the numbers extracted from `$signal`.
+        /// - `$gpio`: the name of the GPIO.
+        ///
+        /// Example data:
+        /// - `(ADC2_CH5, GPIO12)`
+        /// - `((ADC2_CH5, ADCn_CHm, 2, 5), GPIO12)`
+        ///
+        /// The expanded syntax is only available when the signal has at least one numbered component.
+        #for_each_analog
+
+        /// This macro can be used to generate code for each LP function of each GPIO.
+        ///
+        /// For an explanation on the general syntax, as well as usage of individual/repeated
+        /// matchers, refer to [the crate-level documentation][crate#for_each-macros].
+        ///
+        /// This macro has two options for its "Individual matcher" case:
+        ///
+        /// - `all`: `($signal:ident, $gpio:ident, $af:ident)` - simple case where you only need identifiers, and maybe the function.
+        /// - group: `(($signal:ident, $group:ident $(, $number:literal)+), $gpio:ident, $af:ident, ($( $lp_input_af:ident => $lp_input_signal:ident )*) ($( $lp_output_af:ident => $lp_output_signal:ident )*))` - expanded signal case, where you need the number(s) of a signal, or the general group to which the signal belongs. Every expanded branch ends with the pad's LP input and output function groups (empty on chips without an LP GPIO matrix).
+        ///
+        /// Macro fragments:
+        ///
+        /// - `$signal`: the name of the signal.
+        /// - `$group`: the name of the signal, with numbers replaced by placeholders. For `ADC2_CH3` this is `ADCn_CHm`.
+        /// - `$number`: the numbers extracted from `$signal`.
+        /// - `$gpio`: the name of the GPIO.
+        /// - `$af`: the LP IO MUX function, as an identifier (i.e. for function 0 this is `_0`).
+        ///   This is the name of an `LpFunction` variant, and its number is the value to write to
+        ///   the pad's function select field.
+        /// - `$lp_input_af`: the LP IO MUX function for an LP peripheral input on this pad.
+        /// - `$lp_input_signal`: the LP peripheral input signal name.
+        /// - `$lp_output_af`: the LP IO MUX function for an LP peripheral output on this pad.
+        /// - `$lp_output_signal`: the LP peripheral output signal name.
+        ///
+        /// Example data:
+        /// - `(LP_GPIO15, GPIO12, _0)`
+        /// - `((LP_GPIO15, LP_GPIOn, 15), GPIO12, _0, () ())`
+        /// - `((LP_GPIO14, LP_GPIOn, 14), GPIO14, _1, () (_0 => LP_UART_TXD))`
+        /// - `((SAR_I2C_SCL_1, SAR_I2C_SCL_n, 1), GPIO2, _3, () ())`
+        ///
+        /// The expanded syntax is only available when the signal has at least one numbered component.
+        #for_each_lp
+
+        /// This macro can be used to generate code for each IOMUX digital function of each GPIO.
+        ///
+        /// IOMUX functions are the alternate digital functions configured via the IO_MUX registers.
+        /// Use this to implement signal-specific traits for peripherals whose pins must bypass the
+        /// GPIO matrix (e.g., EMAC, USB).
+        ///
+        /// For an explanation on the general syntax, as well as usage of individual/repeated
+        /// matchers, refer to [the crate-level documentation][crate#for_each-macros].
+        ///
+        /// This macro has two options for its "Individual matcher" case:
+        ///
+        /// - `all`: `($signal:ident, $gpio:ident, $af:ident)` - simple case where you only need identifiers, and maybe the alternate function.
+        /// - group: `(($signal:ident, $group:ident $(, $number:literal)+), $gpio:ident, $af:ident)` - expanded signal case, where you need the number(s) of a signal, or the general group to which the signal belongs.
+        ///
+        /// Macro fragments:
+        ///
+        /// - `$signal`: the name of the signal.
+        /// - `$group`: the name of the signal, with numbers replaced by placeholders.
+        /// - `$number`: the numbers extracted from `$signal`.
+        /// - `$gpio`: the name of the GPIO.
+        /// - `$af`: the alternate function number, as an identifier (e.g. `_5`).
+        ///
+        /// Example data:
+        /// - `(EMAC_RXD0, GPIO25, _5)`
+        /// - `((EMAC_RXDn, EMAC_RXDn, 0), GPIO25, _5)`
+        ///
+        /// The expanded syntax is only available when the signal has at least one numbered component.
+        #for_each_iomux
+
+        #gpio_for_signal
+
+        /// Defines the `InputSignal` and `OutputSignal` enums.
+        ///
+        /// This macro is intended to be called in esp-hal only.
+        #[macro_export]
+        #[cfg_attr(docsrs, doc(cfg(feature = "_device-selected")))]
+        macro_rules! define_io_mux_signals {
+            () => {
+                #input_signals
+                #output_signals
+            };
+        }
+
+        /// Defines the `LpFunction` enum.
+        ///
+        /// The enum only contains the LP IO MUX functions that the chip implements. It is
+        /// empty on chips without an LP IO peripheral.
+        ///
+        /// This macro is intended to be called in esp-hal only.
+        #[macro_export]
+        #[cfg_attr(docsrs, doc(cfg(feature = "_device-selected")))]
+        macro_rules! define_lp_functions {
+            () => {
+                #lp_functions_enum
+            };
+        }
+
+        /// Defines and implements the `io_mux_reg` function.
+        ///
+        /// The generated function has the following signature:
+        ///
+        /// ```rust,ignore
+        /// pub(crate) fn io_mux_reg(gpio_num: u8) -> &'static crate::pac::io_mux::GPIO0 {
+        ///     // ...
+        /// # unimplemented!()
+        /// }
+        /// ```
+        ///
+        /// This macro is intended to be called in esp-hal only.
+        #[macro_export]
+        #[expect(clippy::crate_in_macro_def)]
+        #[cfg_attr(docsrs, doc(cfg(feature = "_device-selected")))]
+        macro_rules! define_io_mux_reg {
+            () => {
+                #io_mux_accessor
+            };
+        }
+    }
+}
+
+/// Picks the pad to advertise out of the pads that can carry a signal.
+///
+/// Pads are expected in ascending pin number order. Pads that need special attention are only
+/// picked if there is no alternative.
+fn preferred_pad<'a>(mut candidates: impl Iterator<Item = &'a PinConfig>) -> Option<&'a PinConfig> {
+    let first = candidates.next()?;
+    if first.limitations().is_empty() {
+        return Some(first);
+    }
+
+    let unrestricted = candidates.find(|pin| pin.limitations().is_empty());
+
+    Some(unrestricted.unwrap_or(first))
+}
+
+/// Renders `gpio_for_signal!`, which maps direct functions to the name of the pad that provides
+/// them.
+fn render_gpio_for_signal(gpio: &super::GpioProperties) -> TokenStream {
+    let pins = &gpio.pins_and_signals.pins;
+
+    // Collect the pads that provide each direct function. Digital, analog and LP functions share a
+    // namespace here: a signal is either wired to a pad, or it is not.
+    let mut candidates: IndexMap<&str, Vec<&PinConfig>> = IndexMap::new();
+    for pin in pins.iter() {
+        let digital = (0..FunctionMap::COUNT).filter_map(|af| pin.functions.get(af));
+        let analog = (0..AnalogMap::COUNT).filter_map(|af| pin.analog.get(af));
+        let low_power = (0..LowPowerMap::COUNT).filter_map(|af| pin.lp.get(af));
+
+        for signal in digital.chain(analog).chain(low_power) {
+            candidates.entry(signal).or_default().push(pin);
+        }
+    }
+
+    let branches = candidates.iter().filter_map(|(signal, pads)| {
+        let pad = preferred_pad(pads.iter().copied())?;
+
+        let signal = format_ident!("{signal}");
+        let gpio = format!("GPIO{}", pad.pin);
+
+        Some(quote! {
+            (#signal $(, $_fallback:literal)?) => { #gpio };
+        })
+    });
+
+    quote! {
+        /// Returns the name of the GPIO that provides the given signal, as a string.
+        ///
+        /// The macro takes the name of a direct function - a digital IO MUX function, an analog
+        /// function, or an LP IO MUX function - and expands to a string literal like `"GPIO4"`. It
+        /// is meant to keep documentation free of per-chip pin lists.
+        ///
+        /// Signals that are not wired to a pad on this chip have to be routed through the GPIO
+        /// matrix, which can reach any pad. The macro has no pad to return for those, so it accepts
+        /// an optional fallback to expand to instead. The fallback is not validated.
+        ///
+        /// If multiple pads provide the signal, the macro returns one that is not reserved for some
+        /// other purpose, such as booting or interfacing with flash.
+        ///
+        /// Example usage:
+        /// - `gpio_for_signal!(ADC1_CH0)`
+        /// - `gpio_for_signal!(LP_I2C_SDA, "GPIO6")`
+        #[macro_export]
+        #[cfg_attr(docsrs, doc(cfg(feature = "_device-selected")))]
+        macro_rules! gpio_for_signal {
+            #(#branches)*
+            ($_signal:ident, $fallback:literal) => { $fallback };
+        }
+    }
+}
+
+/// Renders the `LpFunction` enum, which lists the LP IO MUX functions of the chip.
+///
+/// Unlike the digital IO MUX, LP pads usually implement only a few functions, so the enum
+/// contains a variant for the used function numbers only.
+fn render_lp_functions(gpio: &super::GpioProperties) -> TokenStream {
+    let mut functions = BTreeMap::new();
+
+    for pin in gpio.pins_and_signals.pins.iter() {
+        for af in 0..LowPowerMap::COUNT {
+            let Some(signal) = pin.lp.get(af) else {
+                continue;
+            };
+            functions.entry(af).or_insert_with(Vec::new).push(signal);
+        }
+    }
+
+    if functions.is_empty() {
+        return quote! {};
+    }
+
+    let gpio_function = functions
+        .iter()
+        .find(|(_, signals)| signals.iter().any(|signal| signal.starts_with("LP_GPIO")))
+        .map(|(af, _)| format_ident!("_{af}"))
+        .expect("No LP_GPIO function found in the pad list");
+
+    let variants = functions.keys().map(|af| {
+        let variant = format_ident!("_{af}");
+        let value = number(*af);
+        let doc = format!("LP IO MUX function {af}.");
+        quote! {
+            #[doc = #doc]
+            #variant = #value,
+        }
+    });
+
+    quote! {
+        /// LP IO MUX function of a pad.
+        ///
+        /// This is the low-power counterpart of `AlternateFunction`: it selects which function
+        /// drives a pad while the pad belongs to the low-power domain.
+        #[derive(Debug, Eq, PartialEq, Copy, Clone, Hash)]
+        #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+        #[doc(hidden)]
+        pub enum LpFunction {
+            #(#variants)*
+        }
+
+        impl LpFunction {
+            /// The function that connects the pad to the LP GPIO peripheral.
+            pub const LP_GPIO: Self = Self::#gpio_function;
+        }
+    }
+}
+
+pub(super) fn render_signals(enum_name: &str, signals: &[IoMuxSignal]) -> TokenStream {
+    if signals.is_empty() {
+        // If there are no signals, we don't need to generate an enum.
+        return quote! {};
+    }
+    let mut variants = vec![];
+
+    for signal in signals {
+        // First, process only signals that have an ID.
+        let Some(id) = signal.id else {
+            continue;
+        };
+
+        let name = format_ident!("{}", signal.name);
+        let value = number(id);
+        variants.push(quote! {
+            #name = #value,
+        });
+    }
+
+    for signal in signals {
+        // Now process signals that do not have an ID.
+        if signal.id.is_some() {
+            continue;
+        };
+
+        let name = format_ident!("{}", signal.name);
+        variants.push(quote! {
+            #name,
+        });
+    }
+
+    let enum_name = format_ident!("{enum_name}");
+
+    quote! {
+        #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
+        #[derive(Debug, PartialEq, Copy, Clone)]
+        #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+        #[doc(hidden)]
+        pub enum #enum_name {
+            #(#variants)*
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Deserialize)]
+pub struct DedicatedGpioChannels {
+    // Cpu -> list of Signals
+    channels: Vec<Vec<String>>,
+}
+
+impl DedicatedGpioChannels {
+    fn channel_count(&self) -> usize {
+        assert!(
+            self.channels
+                .iter()
+                .all(|channel| channel.len() == self.channels[0].len()),
+            "All cores must have the same number of dedicated GPIO channels"
+        );
+        self.channels[0].len()
+    }
+}
+
+impl GenericProperty for DedicatedGpioChannels {
+    fn macros(&self) -> Option<proc_macro2::TokenStream> {
+        let channel_count = self.channel_count();
+        let channel_branches = (0..channel_count).map(number).collect::<Vec<_>>();
+        let signal_branches = self
+            .channels
+            .iter()
+            .enumerate()
+            .flat_map(|(core, channels)| {
+                channels.iter().enumerate().map(move |(channel, signal)| {
+                    let signal = format_ident!("{signal}");
+                    let core = number(core);
+                    let channel = number(channel);
+                    quote! { #core, #channel, #signal }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Some(generate_for_each_macro(
+            "dedicated_gpio",
+            &[
+                ("channels", &channel_branches),
+                ("signals", &signal_branches),
+            ],
+        ))
+    }
+
+    fn property_macro_branches(&self) -> proc_macro2::TokenStream {
+        let channel_count = number(self.channel_count());
+        quote::quote! {
+            ("dedicated_gpio.channel_count") => {
+                #channel_count
+            };
+            ("dedicated_gpio.channel_count", str) => {
+                stringify!(#channel_count)
+            };
+        }
+    }
+}
