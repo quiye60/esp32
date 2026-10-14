@@ -1,3 +1,26 @@
 # Keep user/runtime configuration values in this file.
 [env]
 PATH="/home/qiuye/.rustup/toolchains/esp/xtensa-esp-elf/esp-15.2.0_20250920/xtensa-esp-elf/bin:/home/qiuye/.local/bin:/home/qiuye/.cargo/bin:/home/qiuye/.npm-global/bin:/home/qiuye/.local/share/st/stm32cubeclt_1.21.0:/home/qiuye/.local/share/st/stm32cubeclt_1.21.0/STM32CubeProgrammer/bin:/home/qiuye/.local/share/st/stm32cubeclt_1.21.0/STLink-gdb-server/bin:/home/qiuye/.local/share/st/stm32cubeclt_1.21.0/CMake/bin:/home/qiuye/.local/share/st/stm32cubeclt_1.21.0/Ninja/bin:/home/qiuye/.local/share/st/stm32cubeclt_1.21.0/st-arm-clang/bin:/home/qiuye/.local/share/st/stm32cubeclt_1.21.0/GNU-tools-for-STM32/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/bin/site_perl:/usr/bin/vendor_perl:/usr/bin/core_perl:/home/qiuye/.local/share/JetBrains/Toolbox/scripts"
+
+
+PASSWORD="12345678"
+SSID="ss"
+
+
+# ============================================================================
+# 下面是「可选开关」的备忘，全部保持默认值；要用时取消注释并 cargo clean。
+#
+# 这些变量是 esp-hal / esp-radio / esp-alloc / esp-rtos 的编译期配置，
+# 完整清单见 target/xtensa-esp32s3-none-elf/debug/build/*/out/*_config_table.md
+# （本项目 teach/07-配置esp-config与env.md 有讲怎么查）。
+#
+# --- PSRAM（第 35 课用；只有模组带 PSRAM 才有效，例如 N16R8）---
+# ESP_HAL_CONFIG_PSRAM_MODE = "octal"      # 八线 PSRAM；四线用 "quad"
+#
+# --- 日志级别（第 19 课 UART、第 45 课起的无线课可能想调）---
+# ESP_LOG = "info"                          # off / error / warn / info / debug / trace
+#
+# --- 其它常用（必要时再打开，默认值就是当前行为）---
+# ESP_HAL_CONFIG_PLACE_SWITCH_TABLES_IN_RAM = "true"   # 中断响应更快，多占 RAM
+# ESP_HAL_CONFIG_ICACHE_SIZE = "32KB"
+# ============================================================================

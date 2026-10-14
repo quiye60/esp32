@@ -59,7 +59,7 @@ paste                    = "1.0.15"
 portable-atomic          = { version = "1.11", default-features = false }
 static_cell              = "2"
 
-esp-rom-sys              = { version = "~0.1", path = "../esp-rom-sys" }
+esp-rom-sys              = { version = "~0.1", path = "../esp-rom-sys", features = ["esp32s3"]}
 
 # Unstable dependencies that are not (strictly) part of the public API
 bitfield                 = "0.19"
@@ -73,7 +73,7 @@ strum                    = { version = "0.27.1", default-features = false, featu
 
 esp-config               = { version = "0.8.0", path = "../esp-config" }
 esp-metadata-generated   = { version = "0.5.1", path = "../esp-metadata-generated" }
-esp-sync                 = { version = "0.3.0", path = "../esp-sync" }
+esp-sync                 = { version = "0.3.0", path = "../esp-sync" ,features = ["esp32s3"]}
 procmacros               = { version = "0.23.0", package = "esp-hal-procmacros", path = "../esp-hal-procmacros" }
 
 # Dependencies that are optional because they are used by unstable drivers.
