@@ -1,0 +1,730 @@
+% ============================================================================
+%  peripherals_ESP32S3.tex
+%
+%  ESP32-S3（esp-hal 1.2.2）Peripherals 结构体：全部成员 + 递归成员详解
+%
+%  编译（本机 Arch + TeX Live 已装 ctex/langchinese，可直接跑）：
+%      xelatex -interaction=nonstopmode peripherals_ESP32S3.tex
+%      xelatex -interaction=nonstopmode peripherals_ESP32S3.tex   % 第二遍：目录/引用
+%  或一条命令：
+%      latexmk -xelatex -interaction=nonstopmode peripherals_ESP32S3.tex
+%
+%  表中数据由脚本从 esp-metadata-generated 0.5.3 的
+%  src/_generated_esp32s3.rs 自动提取（可复现，见第 5 节）。
+% ============================================================================
+\documentclass[UTF8,a4paper,11pt,fontset=fandol]{ctexart}
+
+\usepackage{geometry}
+\geometry{left=2.0cm,right=2.0cm,top=2.4cm,bottom=2.4cm}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{cmt}{RGB}{110,110,110}
+\definecolor{kw}{RGB}{0,90,160}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{kw}\bfseries,
+  commentstyle=\color{cmt}\itshape,
+  breaklines=true,
+  breakatwhitespace=false,
+  frame=single,
+  rulecolor=\color{black!25},
+  framesep=4pt,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  upquote=true,
+  extendedchars=true,
+  literate={_}{{\_}}1,
+}
+
+\newcommand{\fld}[1]{\texttt{#1}}
+\newcommand{\tblhead}[1]{\textbf{#1}}
+\setlist[itemize]{leftmargin=1.4em,itemsep=2pt,topsep=3pt}
+\setlength{\parindent}{0pt}
+\setlength{\emergencystretch}{3em}
+\setlength{\parskip}{4pt}
+
+\title{\bfseries ESP32-S3 \texttt{Peripherals} 结构体全解\\[4pt]
+       \large 全部成员 · 递归成员 · 驱动入口 · 编译指令}
+\author{esp-s3 教学项目（esp-hal 1.2.2 / esp-radio 1.0.0-beta.1）}
+\date{\today}
+
+\begin{document}
+\sloppy
+\maketitle
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+芯片 & ESP32-S3（xtensa-esp32s3-none-elf，目标变体 \texttt{esp32s3}）\\
+esp-hal & 1.2.2（开启特性：\texttt{esp32s3}、\texttt{unstable}）\\
+数据来源 & \texttt{esp-metadata-generated 0.5.3} 的 \texttt{\_generated\_esp32s3.rs}\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section*{本文档能回答什么}
+\addcontentsline{toc}{section}{本文档能回答什么}
+\begin{itemize}
+  \item \fld{Peripherals} 结构体一共多少个字段？分别是什么、稳定还是不稳定？
+  \item 每个字段拿到手之后，下一步能取出哪些子对象（\textbf{下一层}），再下一步呢（\textbf{递归}）？
+  \item 哪些外设自带「中断源子成员」和对应的 \fld{bind\_*\_interrupt} 方法？
+  \item 哪些引脚是 strapping / USB / JTAG / flash 占用的「特殊脚」，用之前要小心什么？
+  \item 怎么自己重新生成这些表（不靠猜、不靠记忆）？
+\end{itemize}
+
+\tableofcontents
+\newpage
+
+% ============================================================================
+\section{\texttt{Peripherals} 是什么}
+
+\subsection{它是「宏生成」的单例容器}
+
+\fld{Peripherals} 不是手写结构体，而是 \fld{esp-hal/src/peripherals/mod.rs} 里的
+\fld{for\_each\_peripheral!} 宏根据芯片元数据生成的：
+
+\begin{itemize}
+  \item 每个外设是一个独立类型：\fld{pub struct NAME<'a> \{ \_marker: PhantomData<\&'a mut ()> \}}，
+    带 \fld{\#[non\_exhaustive]}；
+  \item 这些类型在 Rust 里扮演\textbf{唯一所有权凭证}：拿到 \fld{peripherals.UART1} 就等于
+    声称「UART1 归我管」，交给驱动（如 \fld{Uart::new(peripherals.UART1, \dots)}）后所有权转移，
+    编译器保证不会有第二处再用它；
+  \item \fld{Peripherals} 把所有外设一次性装好，字段类型都是 \fld{NAME<'static>}：
+
+\begin{lstlisting}
+#[allow(non_snake_case)]
+#[non_exhaustive]
+pub struct Peripherals {
+    pub GPIO0: GPIO0<'static>,
+    pub GPIO1: GPIO1<'static>,
+    // ... 共 124 个字段
+    pub WIFI:  WIFI<'static>,
+    pub BT:    BT<'static>,
+}
+\end{lstlisting}
+\end{itemize}
+
+\subsection{四个必须记住的语义}
+
+\begin{description}[leftmargin=2.2cm,style=nextline]
+  \item[\fld{Peripherals::take()}] 取出唯一一份 \fld{Peripherals}，返回
+    \fld{Option<Peripherals>}（第二次调用得到 \fld{None}）。
+    本项目所有课程都在 \fld{esp\_hal::init(config)} 里隐式完成这一步：它返回的就是
+    \fld{Peripherals}，所以自己不需要再 \fld{take()}。
+  \item[\fld{unsafe Peripherals::steal()}] 绕过检查、凭空再生成一份 \fld{Peripherals}。
+    \textbf{安全前提}：同一时刻只能存在一份。典型用途：在 \fld{main} 之外的上下文
+    （如测试、裸启动代码）里补拿外设。误用后果是「两个驱动操作同一个寄存器块」，
+    现象往往是随机挂死，极难调试。
+  \item[\fld{peripheral.steal() / clone\_unchecked()}] 单个外设上的同类操作；
+    \fld{clone\_unchecked()} 返回同生命周期的副本（同样要求「同时只有一份在用」）。
+  \item[\fld{reborrow()}] 生成一个\textbf{更短生命周期}的引用：驱动被 drop 之后
+    还能继续用这个外设（本项目 \fld{rtc\_cntl} 内部用它把 \fld{RTC\_TIMER} 借给 \fld{Rtc}）。
+\end{description}
+
+\subsection{每个字段自身有哪些「成员」}
+
+宏给每个外设类型生成了统一的成员集合（这就是\textbf{递归的第一层}）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{4.6cm}p{10.6cm}@{}}
+\toprule
+成员 & 说明 \\
+\midrule
+\fld{unsafe fn steal()} & 凭空造一个实例（同时只能有一份）\\
+\fld{unsafe fn clone\_unchecked()} & 造一个副本引用（同上）\\
+\fld{fn reborrow(\&mut self) -> NAME<'\_>} & 缩短生命周期，便于「驱动 drop 后继续用」\\
+\fld{fn bind\_X\_interrupt(handler)} & 仅 21 个外设有；把中断处理器绑到 X 号中断源（见表 \ref{tab:ints}）\\
+\fld{fn enable\_X(priority)} & 仅 21 个外设有；在给定优先级上打开该中断\\
+\fld{fn disable\_X() / disable\_X\_on\_all\_cores()} & 关闭中断（单核 / 全部核）\\
+\fld{fn regs() / fn register\_block()} & 拿寄存器块（\texttt{unstable}，写裸驱动才用）\\
+\fld{const PTR / fn ptr()} & 寄存器块指针（\texttt{unstable}，同上）\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{稳定 vs 不稳定（\texttt{unstable} 特性）}
+
+esp-hal 用「结构性不稳定」（\fld{\#[instability::unstable]}）把外设分成两类：
+标记为不稳定的外设，只有在打开 \fld{unstable} 特性时才存在。
+\textbf{本项目的 \fld{Cargo.toml} 打开了该特性}，所以下面 \fld{Peripherals} 124 个字段全部可用。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lr@{}}
+\toprule
+\tblhead{统计项} & \tblhead{数量} \\
+\midrule
+\fld{Peripherals} 字段总数 & 124 \\
+其中 GPIO 引脚（GPIO0--21、GPIO26--48） & 45 \\
+其它外设 & 79 \\
+稳定字段（无需 \texttt{unstable} 特性） & 53 \\
+标记 \texttt{unstable} 的字段（本项目已开启该特性） & 71 \\
+带中断源子成员的外设 & 21 \\
+可挂 DMA 的外设 & 10 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ============================================================================
+\newpage
+\section{全部成员一览（124 个字段）}
+
+\subsection{非 GPIO 字段（79 个）}
+
+「驱动入口 / 递归下一层」一列写的是：拿到这个字段后，通常怎么把它变成可用对象，
+以及从这个对象还能继续取出哪些子对象（再往下就是具体驱动的方法）。
+「课」一列指本项目 \fld{src/bin} 里真正用到它的课程。
+
+\begin{center}\footnotesize
+\begin{longtable}{@{}p{2.15cm}p{1.0cm}>{\raggedright\arraybackslash}p{9.4cm}p{1.65cm}@{}}
+\caption{非 GPIO 字段（按元数据顺序）}\label{tab:main}\\
+\toprule
+\tblhead{字段} & \tblhead{门控} & \tblhead{驱动入口 / 递归下一层} & \tblhead{课} \\
+\midrule
+\endfirsthead
+\toprule
+\tblhead{字段} & \tblhead{门控} & \tblhead{驱动入口 / 递归下一层} & \tblhead{课} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+\fld{DMA\_CH0} & unstable & dma::\allowbreak Channel::\allowbreak new(peripherals.DMA\_CH0) →\allowbreak  .rx /\allowbreak  .tx（ChannelRx/\allowbreak ChannelTx）→\allowbreak  DmaRxBuf/\allowbreak DmaTxBuf；mem2mem 用 Mem2Mem::\allowbreak new(DMA\_CH0, SPI2) & 38 \\
+\fld{DMA\_CH1} & unstable & 同 DMA\_CH0（另一个可用通道） & 38 \\
+\fld{DMA\_CH2} & unstable & 同 DMA\_CH0 &  \\
+\fld{DMA\_CH3} & unstable & 同 DMA\_CH0 &  \\
+\fld{DMA\_CH4} & unstable & 同 DMA\_CH0 &  \\
+\fld{SDM\_CH0} & unstable & sdm::\allowbreak Channel::\allowbreak new(peripherals.SDM\_CH0, pin, cfg) →\allowbreak  set\_duty /\allowbreak  set\_pulse\_density & 31 \\
+\fld{SDM\_CH1} & unstable & 同 SDM\_CH0 &  \\
+\fld{SDM\_CH2} & unstable & 同 SDM\_CH0 &  \\
+\fld{SDM\_CH3} & unstable & 同 SDM\_CH0 &  \\
+\fld{SDM\_CH4} & unstable & 同 SDM\_CH0 &  \\
+\fld{SDM\_CH5} & unstable & 同 SDM\_CH0 &  \\
+\fld{SDM\_CH6} & unstable & 同 SDM\_CH0 &  \\
+\fld{SDM\_CH7} & unstable & 同 SDM\_CH0 &  \\
+\fld{AES} & unstable & Aes::\allowbreak new(peripherals.AES) →\allowbreak  encrypt /\allowbreak  decrypt（16 字节分组）；aes::\allowbreak dma 下另有 DMA 后端 & 43 \\
+\fld{APB\_CTRL} & unstable & APB 控制寄存器（TRNG/\allowbreak efuse 时序等内部使用），无用户驱动 &  \\
+\fld{APB\_SARADC} & unstable & ADC（SAR）寄存器块，由 Adc 驱动内部使用 & 24 \\
+\fld{ASSIST\_DEBUG} & unstable & 调试辅助（监视点 /\allowbreak  栈监视），esp-hal 内部使用 &  \\
+\fld{DMA} & unstable & DMA 控制器本体（通道池）；用户通过 DMA\_CHx /\allowbreak  外设的 DMA 版构造函数使用 & 38 \\
+\fld{DS} & unstable & 数字签名寄存器块；esp-hal 1.2.2 没有 ds 模块，无用户驱动 &  \\
+\fld{EXTMEM} & unstable & 外部存储（PSRAM）缓存控制，内部使用 & 35 \\
+\fld{GPIO} & unstable & GPIO 组（中断/\allowbreak 锁定等）；现代写法直接用 peripherals.GPIOn + Input/\allowbreak Output & 16 \\
+\fld{GPIO\_SD} & unstable & gpio::\allowbreak etm::\allowbreak Channels::\allowbreak new(peripherals.GPIO\_SD)（ETM 通道；S3 无 ETM 硬件） &  \\
+\fld{HMAC} & unstable & Hmac::\allowbreak new(peripherals.HMAC) →\allowbreak  init /\allowbreak  configure(M, key\_id) /\allowbreak  update(..) /\allowbreak  finalize(out)（nb 风格） &  \\
+\fld{I2C\_ANA\_MST} & unstable & 模拟域 I2C 主（ADC/\allowbreak SENS 校准用），无用户驱动 &  \\
+\fld{I2C0} & 稳定 & I2c::\allowbreak new(peripherals.I2C0, cfg) →\allowbreak  .with\_sda/\allowbreak .with\_scl →\allowbreak  read/\allowbreak write/\allowbreak write\_read & 21 \\
+\fld{I2C1} & 稳定 & 同 I2C0（另一个 I2C 控制器） &  \\
+\fld{I2S0} & unstable & I2s::\allowbreak new(peripherals.I2S0, DMA\_CHx, TdmConfig) →\allowbreak  .i2s\_tx /\allowbreak  .i2s\_rx →\allowbreak  .with\_bclk/\allowbreak ws/\allowbreak dout/\allowbreak din/\allowbreak mclk & 39 \\
+\fld{I2S1} & unstable & 同 I2S0 &  \\
+\fld{INTERRUPT\_CORE0} & unstable & 核 0 的中断优先级控制器；由 esp\_hal::\allowbreak interrupt 内部使用（用户写 \#[handler]） & 16 \\
+\fld{INTERRUPT\_CORE1} & unstable & 核 1 的中断优先级控制器（多核时用） & 18 \\
+\fld{IO\_MUX} & unstable & gpio::\allowbreak Io::\allowbreak new(peripherals.IO\_MUX)（老式 per-pin 接口；新代码用 peripherals.GPIOn） & 13 \\
+\fld{LCD\_CAM} & unstable & LcdCam::\allowbreak new(peripherals.LCD\_CAM) →\allowbreak  .lcd（I8080/\allowbreak RGB/\allowbreak DPI）/\allowbreak  .cam（摄像头 DVP） & 40 \\
+\fld{LEDC} & unstable & Ledc::\allowbreak new(peripherals.LEDC) →\allowbreak  .timer::\allowbreak <LowSpeed>(Timer0..3) →\allowbreak  .channel(Channel0..7, pin) →\allowbreak  set\_duty /\allowbreak  start\_duty\_fade & 27 \\
+\fld{LPWR} & unstable & LowPower::\allowbreak new(peripherals.LPWR) →\allowbreak  set\_wakeup\_deadline + sleep\_light /\allowbreak  sleep\_deep & 36,44 \\
+\fld{RTC\_TIMER} & unstable & Rtc::\allowbreak new(peripherals.RTC\_TIMER) →\allowbreak  .rwdt（看门狗）/\allowbreak  .swd /\allowbreak  current\_time\_us /\allowbreak  set\_current\_time\_us & 37 \\
+\fld{MCPWM0} & unstable & McPwm::\allowbreak new(peripherals.MCPWM0, clk) →\allowbreak  .timer0..2 /\allowbreak  .operator0..2 /\allowbreak  .fault0..2 /\allowbreak  .capture0..2 →\allowbreak  with\_linked\_pins & 28 \\
+\fld{MCPWM1} & unstable & 同 MCPWM0（第二组 MCPWM，S3 有两组） &  \\
+\fld{PCNT} & unstable & Pcnt::\allowbreak new(peripherals.PCNT) →\allowbreak  .unit0..3 →\allowbreak  .channel0/\allowbreak 1、.counter、set\_filter、resume/\allowbreak pause/\allowbreak clear & 29 \\
+\fld{PERI\_BACKUP} & unstable & 外设寄存器备份/\allowbreak 保持（retention），内部使用 &  \\
+\fld{RMT} & unstable & Rmt::\allowbreak new(peripherals.RMT, Rate) →\allowbreak  .channel0..7 →\allowbreak  configure\_tx/\allowbreak configure\_rx →\allowbreak  with\_pin →\allowbreak  transmit/\allowbreak receive & 30 \\
+\fld{RNG} & unstable & Rng::\allowbreak new()（伪随机，无需参数）；TrngSource::\allowbreak new(peripherals.RNG, peripherals.ADC1) + Trng::\allowbreak try\_new() →\allowbreak  read() & 25,43 \\
+\fld{RSA} & unstable & Rsa::\allowbreak new(peripherals.RSA) →\allowbreak  start\_modular\_exponentiation /\allowbreak  start\_modular\_multiplication（需大缓冲） &  \\
+\fld{RTC\_CNTL} & unstable & RTC 域控制寄存器（Rtc /\allowbreak  sleep 的底层），用户通过 RTC\_TIMER 与 LPWR 使用 & 37 \\
+\fld{LP\_I2C0} & unstable & LP 域 I2C（低功耗域，给 ULP/\allowbreak LP 核使用） &  \\
+\fld{RTC\_IO} & unstable & RTC IO 复用/\allowbreak 模拟控制（touch、DAC 等；S3 无 touch/\allowbreak DAC，故仅内部用） &  \\
+\fld{SDHOST} & unstable & SdHostController::\allowbreak new(peripherals.SDHOST, cfg) →\allowbreak  .slot::\allowbreak <0|1>(SlotConfig) →\allowbreak  .with\_clk/\allowbreak cmd/\allowbreak data0..3 →\allowbreak  into\_async() 实现 sdio::\allowbreak MmcBus & 41 \\
+\fld{SENS} & unstable & 模拟前端寄存器块（内部温度/\allowbreak touch 公用）。esp-hal 1.2.2 在 S3 无 tsens 模块（soc\_has\_tsens=false），没有用户驱动 &  \\
+\fld{SENSITIVE} & unstable & RTC 域敏感寄存器，内部使用 &  \\
+\fld{SHA} & unstable & Sha::\allowbreak new(peripherals.SHA) →\allowbreak  start::\allowbreak <Sha256>() →\allowbreak  update(..) /\allowbreak  finish(\&mut out)（nb 风格流式） & 43 \\
+\fld{SPI0} & unstable & 内部 flash 专用 SPI（用户不要用） &  \\
+\fld{SPI1} & unstable & PSRAM 专用 SPI（用户不要用） &  \\
+\fld{SPI2} & 稳定 & master::\allowbreak Spi::\allowbreak new(peripherals.SPI2, cfg) →\allowbreak  .with\_sck/\allowbreak mosi/\allowbreak miso/\allowbreak cs →\allowbreak  transfer/\allowbreak write/\allowbreak read（slave 版：slave::\allowbreak Spi::\allowbreak new） & 22,38 \\
+\fld{SPI3} & 稳定 & 同 SPI2 &  \\
+\fld{SYSTEM} & unstable & 系统寄存器（时钟树/\allowbreak 复位控制），内部使用 &  \\
+\fld{SYSTIMER} & unstable & SystemTimer::\allowbreak new(peripherals.SYSTIMER) →\allowbreak  .alarm0/\allowbreak 1/\allowbreak 2（配 PeriodicTimer）；SystemTimer::\allowbreak unit\_value(Unit::\allowbreak Unit0) 读原始计数 & 37,44 \\
+\fld{TIMG0} & unstable & TimerGroup::\allowbreak new(peripherals.TIMG0) →\allowbreak  .timer0 /\allowbreak  .timer1 /\allowbreak  .wdt（timer0 当调度器时基） & 13,17,37 \\
+\fld{TIMG1} & unstable & 同 TIMG0（第二个定时器组） &  \\
+\fld{TWAI0} & unstable & TwaiConfiguration::\allowbreak new(peripherals.TWAI0, rx, tx, baud, mode).start() →\allowbreak  transmit/\allowbreak receive（+ \_async） & 32 \\
+\fld{UART0} & 稳定 & Uart::\allowbreak new(peripherals.UART0, cfg) →\allowbreak  .with\_tx/\allowbreak .with\_rx →\allowbreak  read/\allowbreak write；默认被 ROM/\allowbreak bootloader 当日志口 & 19 \\
+\fld{UART1} & 稳定 & 同 UART0（本项目练手用这个） & 19,23 \\
+\fld{UART2} & 稳定 & 同 UART0 &  \\
+\fld{UHCI0} & unstable & uart::\allowbreak uhci::\allowbreak Uhci::\allowbreak new(uart, peripherals.UHCI0, DMA\_CHx)（给 UART 挂 DMA 的外设） &  \\
+\fld{USB\_FS} & unstable & Usb::\allowbreak new\_fs(peripherals.USB\_FS, DP=GPIO20, DM=GPIO19) →\allowbreak  embassy-usb Driver（CDC-ACM 等） & 42 \\
+\fld{USB\_DEVICE} & unstable & UsbSerialJtag::\allowbreak new(peripherals.USB\_DEVICE) →\allowbreak  read/\allowbreak write（芯片内置 USB-Serial-JTAG） & 20 \\
+\fld{WCL} & unstable & 无线相关内部寄存器块（无用户驱动） &  \\
+\fld{XTS\_AES} & unstable & Flash XTS-AES 加解密（flash 加密功能使用） &  \\
+\fld{ADC1} & unstable & AdcConfig::\allowbreak new() →\allowbreak  enable\_pin(pin, Attenuation) →\allowbreak  Adc::\allowbreak new(peripherals.ADC1, cfg) →\allowbreak  read\_blocking/\allowbreak read\_oneshot & 24 \\
+\fld{ADC2} & unstable & 同 ADC1，但与 Wi-Fi 共用射频，联网项目请用 ADC1 &  \\
+\fld{BT} & unstable & BleConnector::\allowbreak new(peripherals.BT, cfg) →\allowbreak  trouble\_host::\allowbreak ExternalController::\allowbreak new(..) →\allowbreak  Stack →\allowbreak  peripheral()/\allowbreak central()/\allowbreak runner() & 51--58 \\
+\fld{CPU\_CTRL} & unstable & system::\allowbreak CpuControl::\allowbreak new(peripherals.CPU\_CTRL) →\allowbreak  start\_app\_core(..)（启动第二核） & 18 \\
+\fld{FLASH} & unstable & esp\_storage::\allowbreak FlashStorage::\allowbreak new(peripherals.FLASH) →\allowbreak  read/\allowbreak erase/\allowbreak write；OTA 分区表与切槽也走它 & 34,55 \\
+\fld{GPIO\_DEDICATED} & unstable & gpio::\allowbreak dedicated::\allowbreak DedicatedGpio::\allowbreak new(peripherals.GPIO\_DEDICATED)（CPU 专用快速 GPIO） &  \\
+\fld{PSRAM} & unstable & esp\_alloc::\allowbreak psram\_allocator!(peripherals.PSRAM, esp\_hal::\allowbreak psram)（把 PSRAM 挂进堆） & 35 \\
+\fld{ULP\_RISCV\_CORE} & unstable & lp\_core::\allowbreak UlpCore::\allowbreak new(peripherals.ULP\_RISCV\_CORE) →\allowbreak  run(wakeup\_src)（需另备 LP 固件） &  \\
+\fld{WIFI} & 稳定 & WifiController::\allowbreak new(peripherals.WIFI, cfg) →\allowbreak  connect/\allowbreak scan；派生 esp\_now() /\allowbreak  sniffer()；数据面 Interface::\allowbreak station() →\allowbreak  embassy\_net & 45-52,56 \\
+\fld{FROM\_CPU\_INTR0} & unstable & 核间软件中断；esp\_rtos::\allowbreak start(timg0.timer0, peripherals.FROM\_CPU\_INTR0) 用它当时基中断 & 13+ \\
+\fld{FROM\_CPU\_INTR1} & unstable & 同 FROM\_CPU\_INTR0（另一个可用软件中断） &  \\
+\fld{FROM\_CPU\_INTR2} & unstable & 同前 &  \\
+\fld{FROM\_CPU\_INTR3} & unstable & 同前 &  \\
+\end{longtable}
+\end{center}
+
+\newpage
+\subsection{GPIO 引脚字段（45 个）}
+
+ESP32-S3 没有 GPIO22--GPIO25，所以字段是 GPIO0--GPIO21 与 GPIO26--GPIO48，共 45 个。
+「备注」一列来自 esp-hal 生成的文档警告（strapping / USB / JTAG / flash / PSRAM 占用）。
+GPIO15、GPIO16 只在未启用 32\,kHz 晶振（\fld{use\_xtal32k} 关闭）时才存在。
+
+\begin{center}\footnotesize
+\begin{longtable}{@{}p{1.4cm}>{\raggedright\arraybackslash}p{5.2cm}>{\raggedright\arraybackslash}p{5.2cm}p{1.4cm}@{}}
+\caption{GPIO 引脚字段与特殊说明}\label{tab:gpio}\\
+\toprule
+\tblhead{引脚} & \tblhead{限制 / 特殊说明} & \tblhead{本项目用途} & \tblhead{课} \\
+\midrule
+\endfirsthead
+\toprule
+\tblhead{引脚} & \tblhead{限制 / 特殊说明} & \tblhead{本项目用途} & \tblhead{课} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+\fld{GPIO0} & strapping 脚：决定芯片启动方式 & 按 BOOT 键读分区/切槽（55）；LEDC 输出示例（官方版） & 55 \\
+\fld{GPIO1} & 通用 IO（无特殊限制） & ADC1 通道 0，接电位器（24） & 24 \\
+\fld{GPIO2} & 通用 IO（无特殊限制） & 板载 LED（14、18、23、27、28 演示灯）；PCNT 计数源示例 &  \\
+\fld{GPIO3} & strapping 脚：决定芯片启动方式 & 备用（strapping 脚，慎用） &  \\
+\fld{GPIO4} & 通用 IO（无特殊限制） & RMT 波形输出（30）、TWAI 自检 TX/RX（32） & 30 \\
+\fld{GPIO5} & 通用 IO（无特殊限制） & MCPWM PWMA（28）、WS2812 数据线（30） & 28 \\
+\fld{GPIO6} & 通用 IO（无特殊限制） & MCPWM PWMB（28，互补输出） &  \\
+\fld{GPIO7} & 通用 IO（无特殊限制） & SDM 输出，接 RC 看平均电压（31） & 31 \\
+\fld{GPIO8} & 通用 IO（无特殊限制） & -- &  \\
+\fld{GPIO9} & 通用 IO（无特殊限制） & 按键（15、16、29，内部上拉） &  \\
+\fld{GPIO10} & 通用 IO（无特殊限制） & -- &  \\
+\fld{GPIO11} & 通用 IO（无特殊限制） & -- &  \\
+\fld{GPIO12} & 通用 IO（无特殊限制） & -- &  \\
+\fld{GPIO13} & 通用 IO（无特殊限制） & -- &  \\
+\fld{GPIO14} & 通用 IO（无特殊限制） & -- &  \\
+\fld{GPIO15} & 通用 IO（无特殊限制）（需 ld{use\_xtal32k} 关闭才存在） & -- &  \\
+\fld{GPIO16} & 通用 IO（无特殊限制）（需 ld{use\_xtal32k} 关闭才存在） & -- &  \\
+\fld{GPIO17} & 通用 IO（无特殊限制） & UART1 TX（19、23）；深/浅睡眠唤醒脚（36、44） & 19,23 \\
+\fld{GPIO18} & 通用 IO（无特殊限制） & UART1 RX（19） & 19 \\
+\fld{GPIO19} & 可被 USB 调试占用 & USB OTG DM（42） & 42 \\
+\fld{GPIO20} & 可被 USB 调试占用 & USB OTG DP（42） & 42 \\
+\fld{GPIO21} & 通用 IO（无特殊限制） & -- &  \\
+\fld{GPIO26} & 可能被 SPI PSRAM 占用 & -- &  \\
+\fld{GPIO27} & 可能被 SPI flash 占用；可能被 SPI PSRAM 占用 & -- &  \\
+\fld{GPIO28} & 可能被 SPI flash 占用；可能被 SPI PSRAM 占用 & -- &  \\
+\fld{GPIO29} & 可能被 SPI flash 占用 & -- &  \\
+\fld{GPIO30} & 可能被 SPI flash 占用；可能被 SPI PSRAM 占用 & -- &  \\
+\fld{GPIO31} & 可能被 SPI flash 占用；可能被 SPI PSRAM 占用 & -- &  \\
+\fld{GPIO32} & 可能被 SPI flash 占用 & -- &  \\
+\fld{GPIO33} & 可能被 Octal SPI flash 占用；可能被 Octal SPI PSRAM 占用 & -- &  \\
+\fld{GPIO34} & 可能被 Octal SPI flash 占用；可能被 Octal SPI PSRAM 占用 & -- &  \\
+\fld{GPIO35} & 可能被 Octal SPI flash 占用；可能被 Octal SPI PSRAM 占用 & -- &  \\
+\fld{GPIO36} & 可能被 Octal SPI flash 占用；可能被 Octal SPI PSRAM 占用 & -- &  \\
+\fld{GPIO37} & 可能被 Octal SPI flash 占用；可能被 Octal SPI PSRAM 占用 & -- &  \\
+\fld{GPIO38} & 通用 IO（无特殊限制） & SD 卡 CMD（41） & 41 \\
+\fld{GPIO39} & 可被外部 JTAG 调试器占用 & SD 卡 CLK（41） & 41 \\
+\fld{GPIO40} & 可被外部 JTAG 调试器占用 & SD 卡 DAT0（41） & 41 \\
+\fld{GPIO41} & 可被外部 JTAG 调试器占用 & -- &  \\
+\fld{GPIO42} & 可被外部 JTAG 调试器占用 & -- &  \\
+\fld{GPIO43} & 默认被 UART 下载/日志接口使用 & -- &  \\
+\fld{GPIO44} & 默认被 UART 下载/日志接口使用 & -- &  \\
+\fld{GPIO45} & strapping 脚：决定芯片启动方式 & LCD 背光（40 的 8080 屏示例） &  \\
+\fld{GPIO46} & strapping 脚：决定芯片启动方式 & -- &  \\
+\fld{GPIO47} & 通用 IO（无特殊限制） & -- &  \\
+\fld{GPIO48} & 通用 IO（无特殊限制） & -- &  \\
+\end{longtable}
+\end{center}
+
+\newpage
+\subsection{带「中断源子成员」的字段（21 个）}
+
+只有这些外设在元数据里声明了中断源，因此也只有它们会生成
+\fld{bind\_*\_interrupt} / \fld{enable\_*} / \fld{disable\_*} 这类方法。
+注意：\fld{LEDC}、\fld{MCPWM0/1}、\fld{PCNT}、\fld{RMT}、\fld{SYSTIMER}、\fld{TIMG0/1}、
+\fld{TWAI0}、\fld{SDHOST}、\fld{LCD\_CAM} 等\textbf{没有}这一层成员
+—— 它们的中断要么由驱动内部走别的机制（如系统定时器统一中断），要么本版本尚未支持。
+
+\begin{center}\footnotesize
+\begin{longtable}{@{}p{2.2cm}p{2.85cm}>{\raggedright\arraybackslash}p{7.55cm}@{}}
+\caption{带中断源子成员的外设}\label{tab:ints}\\
+\toprule
+\tblhead{字段} & \tblhead{中断源} & \tblhead{由元数据生成的方法} \\
+\midrule
+\endfirsthead
+\toprule
+\tblhead{字段} & \tblhead{中断源} & \tblhead{由元数据生成的方法} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+\fld{DMA\_CH0} & \fld{DMA\_IN\_CH0} & \fld{bind\_dma\_in\_interrupt} / \fld{enable\_dma\_in\_interrupt} / \fld{disable\_dma\_in\_interrupt} \\
+\fld{DMA\_CH0} & \fld{DMA\_OUT\_CH0} & \fld{bind\_dma\_out\_interrupt} / \fld{enable\_dma\_out\_interrupt} / \fld{disable\_dma\_out\_interrupt} \\
+\fld{DMA\_CH1} & \fld{DMA\_IN\_CH1} & \fld{bind\_dma\_in\_interrupt} / \fld{enable\_dma\_in\_interrupt} / \fld{disable\_dma\_in\_interrupt} \\
+\fld{DMA\_CH1} & \fld{DMA\_OUT\_CH1} & \fld{bind\_dma\_out\_interrupt} / \fld{enable\_dma\_out\_interrupt} / \fld{disable\_dma\_out\_interrupt} \\
+\fld{DMA\_CH2} & \fld{DMA\_IN\_CH2} & \fld{bind\_dma\_in\_interrupt} / \fld{enable\_dma\_in\_interrupt} / \fld{disable\_dma\_in\_interrupt} \\
+\fld{DMA\_CH2} & \fld{DMA\_OUT\_CH2} & \fld{bind\_dma\_out\_interrupt} / \fld{enable\_dma\_out\_interrupt} / \fld{disable\_dma\_out\_interrupt} \\
+\fld{DMA\_CH3} & \fld{DMA\_IN\_CH3} & \fld{bind\_dma\_in\_interrupt} / \fld{enable\_dma\_in\_interrupt} / \fld{disable\_dma\_in\_interrupt} \\
+\fld{DMA\_CH3} & \fld{DMA\_OUT\_CH3} & \fld{bind\_dma\_out\_interrupt} / \fld{enable\_dma\_out\_interrupt} / \fld{disable\_dma\_out\_interrupt} \\
+\fld{DMA\_CH4} & \fld{DMA\_IN\_CH4} & \fld{bind\_dma\_in\_interrupt} / \fld{enable\_dma\_in\_interrupt} / \fld{disable\_dma\_in\_interrupt} \\
+\fld{DMA\_CH4} & \fld{DMA\_OUT\_CH4} & \fld{bind\_dma\_out\_interrupt} / \fld{enable\_dma\_out\_interrupt} / \fld{disable\_dma\_out\_interrupt} \\
+\fld{AES} & \fld{AES} & \fld{bind\_peri\_interrupt} / \fld{enable\_peri\_interrupt} / \fld{disable\_peri\_interrupt} \\
+\fld{I2C0} & \fld{I2C\_EXT0} & \fld{bind\_peri\_interrupt} / \fld{enable\_peri\_interrupt} / \fld{disable\_peri\_interrupt} \\
+\fld{I2C1} & \fld{I2C\_EXT1} & \fld{bind\_peri\_interrupt} / \fld{enable\_peri\_interrupt} / \fld{disable\_peri\_interrupt} \\
+\fld{I2S0} & \fld{I2S0} & \fld{bind\_peri\_interrupt} / \fld{enable\_peri\_interrupt} / \fld{disable\_peri\_interrupt} \\
+\fld{I2S1} & \fld{I2S1} & \fld{bind\_peri\_interrupt} / \fld{enable\_peri\_interrupt} / \fld{disable\_peri\_interrupt} \\
+\fld{RSA} & \fld{RSA} & \fld{bind\_peri\_interrupt} / \fld{enable\_peri\_interrupt} / \fld{disable\_peri\_interrupt} \\
+\fld{SHA} & \fld{SHA} & \fld{bind\_peri\_interrupt} / \fld{enable\_peri\_interrupt} / \fld{disable\_peri\_interrupt} \\
+\fld{SPI2} & \fld{SPI2} & \fld{bind\_peri\_interrupt} / \fld{enable\_peri\_interrupt} / \fld{disable\_peri\_interrupt} \\
+\fld{SPI3} & \fld{SPI3} & \fld{bind\_peri\_interrupt} / \fld{enable\_peri\_interrupt} / \fld{disable\_peri\_interrupt} \\
+\fld{UART0} & \fld{UART0} & \fld{bind\_peri\_interrupt} / \fld{enable\_peri\_interrupt} / \fld{disable\_peri\_interrupt} \\
+\fld{UART1} & \fld{UART1} & \fld{bind\_peri\_interrupt} / \fld{enable\_peri\_interrupt} / \fld{disable\_peri\_interrupt} \\
+\fld{UART2} & \fld{UART2} & \fld{bind\_peri\_interrupt} / \fld{enable\_peri\_interrupt} / \fld{disable\_peri\_interrupt} \\
+\fld{USB\_FS} & \fld{USB} & \fld{bind\_peri\_interrupt} / \fld{enable\_peri\_interrupt} / \fld{disable\_peri\_interrupt} \\
+\fld{USB\_DEVICE} & \fld{USB\_DEVICE} & \fld{bind\_peri\_interrupt} / \fld{enable\_peri\_interrupt} / \fld{disable\_peri\_interrupt} \\
+\fld{BT} & \fld{BT\_BB} & \fld{bind\_bb\_interrupt} / \fld{enable\_bb\_interrupt} / \fld{disable\_bb\_interrupt} \\
+\fld{BT} & \fld{RWBLE} & \fld{bind\_rwble\_interrupt} / \fld{enable\_rwble\_interrupt} / \fld{disable\_rwble\_interrupt} \\
+\fld{WIFI} & \fld{WIFI\_MAC} & \fld{bind\_mac\_interrupt} / \fld{enable\_mac\_interrupt} / \fld{disable\_mac\_interrupt} \\
+\fld{WIFI} & \fld{WIFI\_PWR} & \fld{bind\_pwr\_interrupt} / \fld{enable\_pwr\_interrupt} / \fld{disable\_pwr\_interrupt} \\
+\end{longtable}
+\end{center}
+
+\subsection{可用 DMA 的外设（元数据里的 \texttt{dma\_eligible} 映射）}
+
+这张表决定了「哪个外设能直接吃 DMA 缓冲、用哪个通道类型」。
+\fld{AhbGdmaChannel} 表示走 AHB 总线上的通用 DMA（S3 的 GDMA）。
+
+\begin{center}\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\tblhead{外设} & \tblhead{类型名} & \tblhead{通道号} & \tblhead{通道类型} \\
+\midrule
+\fld{SPI2} & \fld{Spi2} & 0 & \fld{AhbGdmaChannel} \\
+\fld{SPI3} & \fld{Spi3} & 1 & \fld{AhbGdmaChannel} \\
+\fld{UHCI0} & \fld{Uhci0} & 2 & \fld{AhbGdmaChannel} \\
+\fld{I2S0} & \fld{I2s0} & 3 & \fld{AhbGdmaChannel} \\
+\fld{I2S1} & \fld{I2s1} & 4 & \fld{AhbGdmaChannel} \\
+\fld{LCD\_CAM} & \fld{LcdCam} & 5 & \fld{AhbGdmaChannel} \\
+\fld{AES} & \fld{Aes} & 6 & \fld{AhbGdmaChannel} \\
+\fld{SHA} & \fld{Sha} & 7 & \fld{AhbGdmaChannel} \\
+\fld{APB\_SARADC} & \fld{ApbSaradc} & 8 & \fld{AhbGdmaChannel} \\
+\fld{RMT} & \fld{Rmt} & 9 & \fld{AhbGdmaChannel} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ============================================================================
+\newpage
+\section{递归成员树：从字段到「能干活的对象」}
+
+下面每一族都按\textbf{字段 $\rightarrow$ 下一层 $\rightarrow$ 再下一层}三层展开。
+括号里标注本项目实际使用它的课程号。
+
+\subsection{GPIO 与引脚矩阵（第 14--16、29、30、36、40--44 课）}
+\begin{itemize}
+  \item \fld{GPIO0..GPIO48} $\rightarrow$
+    \fld{gpio::Output::new}、\fld{gpio::Input::new}、\fld{gpio::AnyPin} $\rightarrow$
+    方法 \fld{set\_high}、\fld{set\_low}、\fld{toggle}、\fld{wait\_for\_x\_edge}；
+    信号转发 \fld{pin.peripheral\_input()}、\fld{pin.peripheral\_output()} $\rightarrow$
+    接进任意外设（PCNT 的边沿信号、LEDC 的引脚、UART 的 TX/RX 都是这样接的，
+    因为 S3 有 GPIO 交换矩阵，引脚基本可任选）。
+  \item \fld{IO\_MUX} $\rightarrow$ \fld{gpio::Io::new(peripherals.IO\_MUX)}（老式 per-pin 接口；
+    现代写法（本项目）直接用 \fld{peripherals.GPIOn}）。
+  \item \fld{GPIO} $\rightarrow$ GPIO 中断相关（第 16 课）：\fld{Input::listen(Event::..)} +
+    \fld{\#[handler] fn ...}。
+  \item \fld{GPIO\_SD} $\rightarrow$ \fld{gpio::etm::Channels::new(peripherals.GPIO\_SD)}
+    —— 那是 ETM 的 GPIO 任务通道；S3 没有 ETM 外设，所以本项目用不到（第 44 课讲义有说明）。
+  \item \fld{GPIO\_DEDICATED} $\rightarrow$ \fld{gpio::dedicated::DedicatedGpio::new(...)}
+    —— CPU 专用快速 GPIO（不走交换矩阵，延迟最低）。
+\end{itemize}
+
+\subsection{定时与休眠（第 13、17、36、37、44 课）}
+\begin{itemize}
+  \item \fld{TIMG0 / TIMG1} $\rightarrow$ \fld{TimerGroup::new(peripherals.TIMG0)} $\rightarrow$
+    子成员 \fld{.timer0}、\fld{.timer1}、\fld{.wdt}；
+    \fld{timer0} 交给 \fld{esp\_rtos::start(timg0.timer0, peripherals.FROM\_CPU\_INTR0)}
+    当调度器时基，\fld{wdt} 是 TIMG 自带的看门狗。
+  \item \fld{SYSTIMER} $\rightarrow$ \fld{SystemTimer::new(peripherals.SYSTIMER)} $\rightarrow$
+    子成员 \fld{.alarm0}、\fld{.alarm1}、\fld{.alarm2}（配合 \fld{PeriodicTimer::new(alarm)}
+    或 ETM 事件源）；另有 \fld{SystemTimer::unit\_value(Unit::Unit0)} 直接读原始计数。
+  \item \fld{RTC\_TIMER} $\rightarrow$ \fld{rtc\_cntl::Rtc::new(peripherals.RTC\_TIMER)} $\rightarrow$
+    子成员 \fld{.rwdt}（看门狗，\fld{set\_timeout}、\fld{enable}、\fld{feed}）、\fld{.swd}（超级看门狗）、
+    \fld{current\_time\_us()}、\fld{set\_current\_time\_us()}（RTC 时间，可跨深睡眠）。
+  \item \fld{LPWR} $\rightarrow$ \fld{rtc\_cntl::sleep::LowPower::new(peripherals.LPWR)} $\rightarrow$
+    \fld{set\_wakeup\_deadline(Instant)}、\fld{sleep\_light(RtcSleepConfig::default())}
+    （醒来继续跑）/ \fld{sleep\_deep(RtcSleepConfig::deep())}（醒来=重启）；
+    唤醒源由引脚 \fld{apply\_wakeup\_config} 与 \fld{listen} 配置。
+  \item \fld{FROM\_CPU\_INTR0..3} $\rightarrow$ 核心间软件中断。S3 上没有独立的
+    \fld{SW\_INTERRUPT} 外设，所以 \fld{esp\_rtos::start} 的第二个参数就是
+    \fld{peripherals.FROM\_CPU\_INTR0}。
+\end{itemize}
+
+\subsection{PWM / 计数 / 调制（第 27--31 课）}
+\begin{itemize}
+  \item \fld{LEDC} $\rightarrow$ \fld{Ledc::new(peripherals.LEDC)}
+    $\rightarrow$ \fld{.timer::<LowSpeed>}\allowbreak\fld{(timer::Number::Timer0..Timer3)}
+    $\rightarrow$ \fld{.channel(channel::Number::Channel0..Channel7, pin)}
+    $\rightarrow$ \fld{set\_duty / start\_duty\_fade}。
+    （高速通道只在老 ESP32 上有，S3 只有低速组。）
+  \item \fld{MCPWM0 / MCPWM1} $\rightarrow$ \fld{McPwm::new(peripherals.MCPWM0, clk)}
+    $\rightarrow$ 子成员 \fld{.timer0..timer2}、\fld{.operator0..operator2}、
+    \fld{.fault0..fault2}、\fld{.capture0..capture2}
+    $\rightarrow$ \fld{operator.with\_linked\_pins(...)} 得到补/死区成对引脚。
+  \item \fld{PCNT} $\rightarrow$ \fld{Pcnt::new(peripherals.PCNT)}
+    $\rightarrow$ 子成员 \fld{.unit0..unit3}（S3 有 4 个单元）
+    $\rightarrow$ 每个单元里 \fld{.channel0/.channel1}（\fld{set\_edge\_signal}、
+    \fld{set\_input\_mode}）、\fld{.counter}（\fld{get()}）、\fld{set\_low/high\_limit}、
+    \fld{set\_filter}、\fld{resume}、\fld{pause}、\fld{clear}。
+  \item \fld{RMT} $\rightarrow$ \fld{Rmt::new(peripherals.RMT, Rate)}
+    $\rightarrow$ 子成员 \fld{.channel0..channel7}
+    $\rightarrow$ \fld{configure\_tx / configure\_rx} $\rightarrow$ \fld{with\_pin} 后
+    \fld{transmit(\&[PulseCode]) / receive(\dots)}（每个通道可单独设分频）。
+  \item \fld{SDM\_CH0..SDM\_CH7} $\rightarrow$ \fld{sdm::Channel::new(peripherals.SDM\_CHn, pin, cfg)}
+    $\rightarrow$ \fld{set\_duty(0..=255) / set\_pulse\_density(-128..=127)}。
+\end{itemize}
+
+\subsection{串行总线（第 19--23、30、32、39--42 课）}
+\begin{itemize}
+  \item \fld{UART0 / UART1 / UART2} $\rightarrow$ \fld{Uart::new(peripherals.UART1, cfg)}
+    $\rightarrow$ \fld{.with\_tx / .with\_rx / .with\_cts / .with\_rts}
+    $\rightarrow$ \fld{read/write} 或 \fld{.into\_async()} 得到异步版本。
+    \fld{UART0} 默认被 ROM/bootloader 当启动日志口。
+  \item \fld{I2C0 / I2C1} $\rightarrow$ \fld{I2c::new(peripherals.I2C0, cfg)}
+    $\rightarrow$ \fld{.with\_sda / .with\_scl} $\rightarrow$ \fld{read}、\fld{write}、\fld{write\_read}；
+    中断源分别是 \fld{I2C\_EXT0} / \fld{I2C\_EXT1}。
+  \item \fld{SPI2 / SPI3} $\rightarrow$ \fld{master::Spi::new(peripherals.SPI2, cfg)}
+    $\rightarrow$ \fld{.with\_sck / .with\_mosi / .with\_miso / .with\_cs}
+    $\rightarrow$ \fld{transfer}、\fld{write}、\fld{read}（或 slave 版 \fld{slave::Spi::new}）。
+    \fld{SPI0 / SPI1} 是内部 flash / PSRAM 专用，用户不用。
+  \item \fld{I2S0 / I2S1} $\rightarrow$ \fld{I2s::new(peripherals.I2S0, DMA\_CHx, TdmConfig)}
+    $\rightarrow$ 子成员 \fld{.i2s\_tx} / \fld{.i2s\_rx}
+    $\rightarrow$ \fld{.with\_bclk / .with\_ws / .with\_dout / .with\_din}（加 \fld{.with\_mclk}）
+    $\rightarrow$ \fld{write/read} 或 DMA 事务（\fld{dma\_rx\_stream\_buffer!}）。
+  \item \fld{TWAI0}（CAN）$\rightarrow$ \fld{TwaiConfiguration::new(..).start()}
+    $\rightarrow$ \fld{transmit}、\fld{receive}（另有 \fld{\_async} 版本）。
+  \item \fld{SDHOST} $\rightarrow$ \fld{SdHostController::new(peripherals.SDHOST, cfg)}
+    $\rightarrow$ \fld{.slot::<0|1>(SlotConfig)}
+    $\rightarrow$ \fld{.with\_clk / .with\_cmd / .with\_data0..data3 / .with\_card\_detect}
+    $\rightarrow$ \fld{into\_async()} 后实现 \fld{sdio::MmcBus}（接 \fld{sdio} 协议栈）。
+  \item \fld{LCD\_CAM} $\rightarrow$ \fld{LcdCam::new(peripherals.LCD\_CAM)}
+    $\rightarrow$ \fld{.lcd}（I8080 并口 / RGB / DPI）/ \fld{.cam}（摄像头 DVP）
+    $\rightarrow$ \fld{I8080::new(lcd, DMA\_CHx, cfg).with\_dc().with\_wrx().with\_data0..7()}。
+  \item \fld{UHCI0} $\rightarrow$ \fld{uart::uhci::Uhci::new(uart, peripherals.UHCI0, DMA\_CHx)}
+    —— 给 UART 挂 DMA 的工具外设。
+  \item \fld{LP\_I2C0} $\rightarrow$ LP 域（低功耗域）的 I2C，给 ULP / LP 核使用。
+\end{itemize}
+
+\subsection{模拟、随机与传感（第 24、25、31、43 课）}
+\begin{itemize}
+  \item \fld{ADC1 / ADC2} $\rightarrow$ \fld{AdcConfig::new()} $\rightarrow$
+    \fld{config.enable\_pin(pin, Attenuation)} 得到 \fld{AdcPin}
+    $\rightarrow$ \fld{Adc::new(peripherals.ADC1, config)} $\rightarrow$ \fld{read\_blocking/read\_oneshot}。
+    \fld{ADC2} 与 Wi-Fi 冲突（射频共用），联网项目用 \fld{ADC1}。
+    \fld{APB\_SARADC} 是同一套 ADC 的底层寄存器块（驱动内部用）。
+  \item \fld{SENS} $\rightarrow$ 模拟前端（温度传感器/touch 的公用寄存器块）。
+    \textbf{注意}：esp-hal 1.2.2 在 S3 上没有 \fld{tsens} 模块（\fld{soc\_has\_tsens} 为 false），
+    所以这里\textbf{没有}用户驱动：想读内部温度只能用 \fld{peripherals.SENS.regs()} 裸访问寄存器。
+    其它芯片（C6/H2/P4 等）才有 \fld{tsens::TemperatureSensor::new(peripherals.TSENS, cfg)}。
+  \item \fld{SDM\_CHn}：见上一节（用 1 位输出「做」模拟电压，第 31 课）。
+  \item \fld{RNG} $\rightarrow$ \fld{rng::Rng::new()}（伪随机，不需要参数）
+    ；真随机：\fld{TrngSource::new(peripherals.RNG, peripherals.ADC1)} +
+    \fld{Trng::try\_new()} $\rightarrow$ \fld{read(\&mut [u8])}。
+    注意 \fld{TrngSource} 同时占住 \fld{RNG} 和 \fld{ADC1} 两个外设。
+  \item \fld{DAC}：ESP32-S3 \textbf{没有} DAC 外设（老 ESP32 才有），所以这里没有对应字段。
+\end{itemize}
+
+\subsection{加密与安全（第 43 课）}
+\begin{itemize}
+  \item \fld{AES} $\rightarrow$ \fld{Aes::new(peripherals.AES)} $\rightarrow$
+    \fld{encrypt(\&mut block, key)}、\fld{decrypt(..)}（16 字节分组）；\fld{aes::dma} 下还有 DMA 后端。
+  \item \fld{SHA} $\rightarrow$ \fld{Sha::new(peripherals.SHA)}
+    $\rightarrow$ \fld{start::<Sha256>()} $\rightarrow$ \fld{update(..)}、\fld{finish(\&mut out)}（流式，\fld{nb::Result}）。
+  \item \fld{RSA} $\rightarrow$ \fld{Rsa::new(peripherals.RSA)}
+    $\rightarrow$ \fld{start\_modular\_exponentiation / start\_modular\_multiplication}（需大缓冲）。
+  \item \fld{HMAC} $\rightarrow$ \fld{Hmac::new(..)} $\rightarrow$ HMAC-SHA256（配合 flash 加密 / 安全启动）。
+  \item \fld{DS} $\rightarrow$ 数字签名外设寄存器块；esp-hal 1.2.2 \textbf{没有} \fld{ds} 模块，
+    因此无用户驱动（安全启动 / Flash 加密流程相关，需要时走裸寄存器）。
+  \item \fld{XTS\_AES} $\rightarrow$ Flash 的 XTS-AES 加解密（flash 加密功能用它）。
+  \item \fld{FLASH} $\rightarrow$ \fld{esp\_storage::FlashStorage::new(peripherals.FLASH)}
+    $\rightarrow$ \fld{read / erase / write}（第 34 课）、OTA 分区表与切槽（第 55 课）。
+  \item \fld{EFUSE}：S3 \textbf{没有}这个字段（efuse 由 esp-hal 内部的 \fld{esp\_hal::efuse}
+    函数直接读寄存器），所以别在 \fld{peripherals} 里找它。
+    另外提醒：元数据里还定义了 \fld{EFUSE}、\fld{MMU\_TABLE}、\fld{USB\_WRAP} 三个外设\emph{类型}，
+    但它们\textbf{没有}出现在 \fld{Peripherals} 的字段列表里（前者由 HAL 内部使用，
+    后两者是纯内部模块）—— 这也是「字段数 124」与「元数据里定义的外设类型数 127」的差。
+\end{itemize}
+
+\subsection{DMA（第 38 课）}
+\begin{itemize}
+  \item \fld{DMA} $\rightarrow$ 全局 DMA 控制器（通道池）；用户一般不直接拿它，
+    而是把它分配给具体外设。
+  \item \fld{DMA\_CH0..DMA\_CH4} $\rightarrow$ \fld{dma::Channel::new(peripherals.DMA\_CH0)}
+    $\rightarrow$ 子成员 \fld{.rx} / \fld{.tx}（\fld{ChannelRx} / \fld{ChannelTx}）
+    $\rightarrow$ \fld{DmaRxBuf/DmaTxBuf} 等缓冲类型；
+    内存到内存拷贝则用 \fld{Mem2Mem::new(peripherals.DMA\_CH0, peripherals.SPI2)}
+    （S3 上 mem2mem 借用 SPI2 的通道）。
+  \item 每个 \fld{DMA\_CHn} 自带两个中断源：\fld{DMA\_IN\_CHn} 与 \fld{DMA\_OUT\_CHn}
+    （见表 \ref{tab:ints}）。
+\end{itemize}
+
+\subsection{无线（第 45--58 课）}
+\begin{itemize}
+  \item \fld{WIFI} $\rightarrow$ \fld{esp\_radio::wifi::WifiController::new(peripherals.WIFI, cfg)}
+    $\rightarrow$ 控制面方法 \fld{connect\_async}、\fld{scan\_async}、\fld{wait\_for\_disconnect\_async}
+    $\rightarrow$ 还可以从它派生两条支线：
+    \fld{controller.esp\_now()}（ESP-NOW，第 52 课）与
+    \fld{controller.sniffer()}（混杂模式 + 帧注入，第 56 课）。
+    数据面是 \fld{esp\_radio::wifi::Interface::station() / access\_point()}，
+    交给 \fld{embassy\_net::new(..)} 组成协议栈（第 45--50 课）。
+  \item \fld{BT} $\rightarrow$ \fld{esp\_radio::ble::controller::BleConnector::new(peripherals.BT, cfg)}
+    $\rightarrow$ \fld{trouble\_host::ExternalController::new(connector)}
+    $\rightarrow$ \fld{trouble\_host::new(controller, \&mut resources).build()}
+    $\rightarrow$ 角色分支 \fld{.peripheral()} / \fld{.central()} / \fld{.runner()}
+    （第 53、54、57、58 课）。
+\end{itemize}
+
+\subsection{系统、核与内部外设}
+\begin{itemize}
+  \item \fld{CPU\_CTRL} $\rightarrow$ \fld{system::CpuControl::new(peripherals.CPU\_CTRL)}
+    $\rightarrow$ \fld{start\_app\_core(..)}（启动第二核，见第 18 课的多核附录）。
+  \item \fld{INTERRUPT\_CORE0 / INTERRUPT\_CORE1} $\rightarrow$ 两个核各自的中断优先级控制器，
+    由 \fld{esp\_hal::interrupt} 内部使用（用户写 \fld{\#[handler]} 或
+    \fld{peripherals.X.bind\_*\_interrupt(handler)} 即可）。
+  \item \fld{PSRAM} $\rightarrow$ \fld{esp\_alloc::psram\_allocator!(peripherals.PSRAM, esp\_hal::psram)}
+    （第 35 课）；\fld{EXTMEM} 是同一块外部存储的缓存控制寄存器块。
+  \item \fld{ULP\_RISCV\_CORE} $\rightarrow$ \fld{lp\_core::UlpCore::new(peripherals.ULP\_RISCV\_CORE)}
+    $\rightarrow$ \fld{run(wakeup\_src)}；需要另外准备一段跑在 LP 核上的固件（第 44 课讲义）。
+  \item 剩下的纯内部寄存器块（\fld{PERI\_BACKUP}、\fld{WCL}、\fld{I2C\_ANA\_MST}、
+    \fld{ASSIST\_DEBUG}、\fld{SENSITIVE}、\fld{SYSTEM}、\fld{APB\_CTRL}、\fld{RTC\_IO}、
+    \fld{RTC\_CNTL}、\fld{SPI0}、\fld{SPI1}）：目前没有面向用户的驱动，
+    由 esp-hal 内部或 \fld{regs()} 裸寄存器访问使用。
+\end{itemize}
+
+% ============================================================================
+\newpage
+\section{编译指令}
+
+\subsection{依赖：CTeX 中文支持}
+
+报 \fld{ctex.sty not found} 说明没装中文支持（Arch Linux）：
+
+\begin{lstlisting}[language=bash]
+sudo pacman -S texlive-langchinese texlive-latexextra texlive-fontsrecommended
+\end{lstlisting}
+
+Debian/Ubuntu 对应 \fld{texlive-lang-chinese texlive-latex-extra}。
+本文档用 \fld{fontset=fandol}：字体随 TeX Live 自带，不依赖系统里的中文字体。
+
+\subsection{编译（推荐：xelatex 两遍）}
+
+中文文档要用 \textbf{XeLaTeX} 或 LuaLaTeX（不要用 pdflatex）：
+
+\begin{lstlisting}[language=bash]
+cd docs
+
+# 第一遍：生成 .aux/.toc
+xelatex -interaction=nonstopmode peripherals_ESP32S3.tex
+
+# 第二遍：把目录、表号、交叉引用填对（长表格需要两遍）
+xelatex -interaction=nonstopmode peripherals_ESP32S3.tex
+
+# 产物：peripherals_ESP32S3.pdf
+\end{lstlisting}
+
+\subsection{一条命令（latexmk，自动决定遍数）}
+
+\begin{lstlisting}[language=bash]
+# 直接生成 PDF（推荐，自动跑够遍数）
+latexmk -xelatex -interaction=nonstopmode peripherals_ESP32S3.tex
+
+# 想保持目录干净，把中间文件都丢到 build/ 里
+latexmk -xelatex -interaction=nonstopmode -outdir=build peripherals_ESP32S3.tex
+
+# 清理中间文件（-C 连 PDF 一起删，-c 只删中间文件）
+latexmk -c      # 或 latexmk -C
+\end{lstlisting}
+
+\subsection{只想快速看一遍（不生成目录）}
+
+\begin{lstlisting}[language=bash]
+xelatex -interaction=nonstopmode -draftmode peripherals_ESP32S3.tex  # 只查错不排版
+\end{lstlisting}
+
+\subsection{常见报错速查}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{6.0cm}p{9.2cm}@{}}
+\toprule
+报错 & 原因与处理 \\
+\midrule
+\fld{ctex.sty not found} & 缺中文支持包，见上面 pacman 命令 \\
+\fld{You need to run XeLaTeX} & 用 pdflatex 编译了，改 \fld{xelatex} 或 \fld{latexmk -xelatex} \\
+\fld{Missing character: ... (U+XXXX)} & 字体缺字（一般不影响阅读）；换 \fld{fontset=} 或改字体 \\
+\fld{Runaway argument?} & 表格/代码块里有没转义的特殊字符，检查 \fld{\_} 与 \fld{\%} \\
+目录/表号显示 \fld{??} & 只编译了一遍，再跑一遍 xelatex \\
+中文断行难看 & 正常现象；可加 \fld{\textbackslash sloppy} 或手动换行 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{编辑器里一键编译}
+
+\begin{itemize}
+  \item \textbf{VS Code}：装 \fld{LaTeX Workshop}，选 \fld{Recipe: latexmk (xelatex)}；
+  \item \textbf{TeXstudio}：选项 $\rightarrow$ 构建 $\rightarrow$ 默认编译器选 \fld{XeLaTeX}；
+  \item \textbf{CLI 老手}：直接用上面的 \fld{latexmk} 一行命令。
+\end{itemize}
+
+% ============================================================================
+\newpage
+\section{这些表是怎么来的（可复现）}
+
+表里的字段名、稳定性标记、中断源、引脚警告\textbf{全部来自编译期元数据}，不是手抄文档：
+
+\begin{lstlisting}[language=bash]
+# 1) 找到 esp-hal 实际使用的元数据（版本由 Cargo.lock 决定，本项目是 0.5.3）
+grep -n "esp-metadata-generated" -A2 Cargo.lock
+
+# 2) 打开对应的芯片文件，看两个关键宏调用：
+#      _for_each_inner_peripheral!((all( ... )));        <- 每个外设的文档/中断源
+#      _for_each_inner_peripheral!((singletons( ... ))); <- Peripherals 的字段列表
+#      _for_each_inner_peripheral!((dma_eligible( ... )));<- 哪些外设能挂 DMA
+less ~/.cargo/registry/src/*/esp-metadata-generated-0.5.3/src/_generated_esp32s3.rs
+
+# 3) 已编译好的工程里，esp-hal 展开后的代码也在 target 里
+ls target/xtensa-esp32s3-none-elf/release/build/ | grep -i metadata
+\end{lstlisting}
+
+本文档的表就是按这三处数据生成的：字段列表取自 \fld{singletons}，
+稳定性标记取自字段后面的 \fld{(unstable)}，中断源取自 \fld{all} 里的
+\fld{INT : \{ bind\_.., enable\_.., disable\_.. \}}，引脚警告取自各 GPIO 条目的
+\fld{<li>} 文字，DMA 映射取自 \fld{dma\_eligible}。
+
+仓库里附了一份生成脚本 \fld{docs/gen\_peripherals\_tex.py}：它读取上面的元数据、
+重新算出 4 张表 + 1 张统计表，然后\textbf{原地刷新本文档}（可反复运行，幂等）。
+\begin{lstlisting}[language=bash]
+cd <仓库根目录>
+python3 docs/gen_peripherals_tex.py     # 只更新 tex 里的表格与数量
+latexmk -xelatex -interaction=nonstopmode docs/peripherals_ESP32S3.tex
+\end{lstlisting}
+
+\vspace{6pt}
+\noindent\rule{\textwidth}{0.4pt}
+
+\noindent\textbf{一句话总结}：\fld{Peripherals} 的每个字段都是「一次性所有权凭证」，
+它的递归成员就是「凭证 $\rightarrow$ 驱动对象 $\rightarrow$ 这个对象的子句柄/信号」
+这三层；而中断源（\fld{bind\_*\_interrupt}）与 DMA 归属则是编译期就被元数据写死的两条约束。
+
+\end{document}

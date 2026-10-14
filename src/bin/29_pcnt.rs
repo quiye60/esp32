@@ -52,7 +52,7 @@ async fn main(_spawner: Spawner) -> ! {
 
     // ---------------- 1. 建 PCNT，拿一个「计数单元」 ----------------
     let pcnt = Pcnt::new(peripherals.PCNT);
-    let unit0 = pcnt.unit0;                 // S3 有 2 个单元，每单元 2 个通道
+    let unit0 = pcnt.unit0;                 // S3 有 4 个单元（unit0..unit3），每单元 2 个通道
 
     // 计数上下限：到界就触发事件（本课不用中断，设一下更安全）
     unit0.set_low_limit(Some(-30000)).unwrap();
